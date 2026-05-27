@@ -3,7 +3,7 @@ import numpy as np
 import hdf5plugin
 import h5py
 from netCDF4 import Dataset
-from firebench_adapter_common.interpolation import nearest_2d
+from firebench.adapter_common.interpolation import nearest_2d
 
 
 @njit(fastmath=True)

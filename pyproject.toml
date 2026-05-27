@@ -13,6 +13,7 @@ maintainers = [
 ]
 description = "firebench-adapter-wrf-sfire provides a FireBench adapter for the WRF-SFIRE model"
 dependencies = [
+    "firebench",
     "geopandas < 2.0",
     "h5py < 4.0",
     "hdf5plugin >= 6.0",
@@ -50,5 +51,7 @@ dev = [
 ]
 [tool.hatch.envs.default]
 features = ["dev"]
+[tool.hatch.metadata]
+allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/firebench_adapter_wrf_sfire"]

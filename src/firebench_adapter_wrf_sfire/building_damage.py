@@ -2,7 +2,7 @@ import numpy as np
 import hdf5plugin
 import h5py
 from netCDF4 import Dataset
-from firebench_adapter_common.interpolation import find_nearest_grid_point
+from firebench.adapter_common.interpolation import find_nearest_grid_point
 
 
 def get_building_damage(

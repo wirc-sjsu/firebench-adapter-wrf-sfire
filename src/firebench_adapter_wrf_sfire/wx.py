@@ -6,7 +6,7 @@ import firebench.standardize as fs
 from datetime import datetime, timedelta
 from firebench import Quantity, svn
 from bisect import bisect_left, bisect_right
-from firebench_adapter_common.interpolation import find_nearest_grid_point
+from firebench.adapter_common.interpolation import find_nearest_grid_point
 from scipy.interpolate import interp1d
 
 GRAVITY = 9.81
@@ -52,7 +52,10 @@ def _time_in_period_seconds(
     dt_origin = _read_station_time_origin(obs_h5, station_path)
     time_vec_s = _station_time_vector_seconds(obs_h5, station_path)
     offset_start, offset_end = _period_offsets_seconds(dt_origin, period_start_dt, period_end_dt)
-    return time_vec_s[_mask_between_inclusive(time_vec_s, offset_start, offset_end)].astype(np.float64), dt_origin
+    return (
+        time_vec_s[_mask_between_inclusive(time_vec_s, offset_start, offset_end)].astype(np.float64),
+        dt_origin,
+    )
 
 
 def _sfire_time_seconds(wrf_dataset: Dataset, offset_start_s: float) -> np.ndarray:
@@ -230,7 +233,9 @@ def __process_weather_station(
         "position_lon_units",
     ]
     I_FMC_10h = 1
-    time_in_period, time_origin = _time_in_period_seconds(obs_h5, station_path, period_start_dt, period_end_dt)
+    time_in_period, time_origin = _time_in_period_seconds(
+        obs_h5, station_path, period_start_dt, period_end_dt
+    )
     if len(time_in_period) == 0:
         print("No data in time period. Skip")
         return

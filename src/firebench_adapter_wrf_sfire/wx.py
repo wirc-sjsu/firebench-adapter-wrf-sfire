@@ -12,6 +12,7 @@ from scipy.interpolate import interp1d
 
 from ._grid import fire_grid_slice
 from ._skip import skip
+from ._wrfout import WrfDomain, WrfRun, as_run
 
 GRAVITY = 9.81
 
@@ -88,13 +89,12 @@ def _time_in_period_seconds(
     )
 
 
-def _sfire_time_seconds(wrf_dataset: Dataset, offset_start_s: float) -> np.ndarray:
+def _sfire_time_seconds(domain: WrfDomain, offset_start_s: float) -> np.ndarray:
     """
     Compute SFIRE time in seconds relative to the period start.
     Matches existing logic: XTIME (min) -> seconds, then subtract offset_start.
     """
-    xtime_min = np.array(wrf_dataset["XTIME"][:], dtype=np.float64)
-    return Quantity(xtime_min, "min").to("s").magnitude - offset_start_s
+    return Quantity(domain.xtime(), "min").to("s").magnitude - offset_start_s
 
 
 def _bracket_indices_inclusive(model_time: np.ndarray, ref_start: float, ref_end: float):
@@ -250,15 +250,15 @@ def wind_speed(u, v):
     return np.sqrt(u**2 + v**2)
 
 
-def _get_wind_rotation(wrf_dataset: Dataset, time_slice, j: int, i: int):
+def _get_wind_rotation(domain: WrfDomain, time_slice, j: int, i: int):
     """Return mesh rotation coefficients, defaulting to a Cartesian grid."""
-    if "COSALPHA" not in wrf_dataset.variables or "SINALPHA" not in wrf_dataset.variables:
+    if not domain.has("COSALPHA") or not domain.has("SINALPHA"):
         print("COSALPHA/SINALPHA not found. Use Cartesian grid wind rotation.")
         return 1.0, 0.0
 
     return (
-        wrf_dataset["COSALPHA"][time_slice, j, i],
-        wrf_dataset["SINALPHA"][time_slice, j, i],
+        domain.series("COSALPHA", time_slice, j, i),
+        domain.series("SINALPHA", time_slice, j, i),
     )
 
 
@@ -281,7 +281,7 @@ SKIPPABLE_ERRORS = (KeyError, IndexError, ValueError)
 def __process_weather_station(
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    run: WrfRun,
     station_path: str,
     sfire_ref_time: datetime,
     period_start_dt: datetime,
@@ -304,13 +304,15 @@ def __process_weather_station(
         return
 
     grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["XLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["XLONG"][0, grid_slice, grid_slice])
+    # Indices found on the trimmed grid, read on the full one.
+    grid_offset = grid_slice.start or 0
     station_lat = obs_h5[station_path].attrs["position_lat"]
     station_lon = obs_h5[station_path].attrs["position_lon"]
-    if not (xlat.min() <= station_lat <= xlat.max() and xlon.min() <= station_lon <= xlon.max()):
-        # The nearest grid point would be on the edge of the domain, far from the station.
-        skip(station_path, "outside the model domain")
+    # The domains that hold the station, finest first: a variable comes from the first that gives it.
+    candidates = [domain for domain in run.domains if domain.covers(station_lat, station_lon, grid_slice)]
+    if not candidates:
+        # The nearest grid point would be on the edge of a domain, far from the station.
+        skip(station_path, "outside every model domain")
         return
 
     # SFIRE time
@@ -321,35 +323,59 @@ def __process_weather_station(
     offset_start = (period_start_dt - sfire_ref_time).total_seconds()
     offset_station_to_period_start = (time_origin - period_start_dt).total_seconds()
     time_in_period_sfire = time_in_period + offset_station_to_period_start
-    time_sfire = _sfire_time_seconds(wrf_dataset, offset_start)
 
-    # Keep the observation times the simulation covers: the periods inside them can be scored.
-    covered = _mask_between_inclusive(time_in_period_sfire, time_sfire[0], time_sfire[-1])
-    if not covered.any():
+    # Keep the observation times the simulation covers: the periods inside them can be scored. The
+    # finest domain that covers one of them gives the station's times.
+    covered = None
+    for domain in candidates:
+        time_sfire = _sfire_time_seconds(domain, offset_start)
+        if time_sfire.size:
+            mask = _mask_between_inclusive(time_in_period_sfire, time_sfire[0], time_sfire[-1])
+            if mask.any():
+                covered = mask
+                break
+    if covered is None:
         skip(station_path, "no observation time inside the simulation")
         return
     if not covered.all():
         print(f"Simulation covers {covered.sum()} of {covered.size} observation times")
     time_in_period = time_in_period[covered]
     time_in_period_sfire = time_in_period_sfire[covered]
-    i_start, i_end = _bracket_indices_inclusive(
-        time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1]
-    )
-    _validate_bracket(i_start, i_end, time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1])
-    model_time = time_sfire[i_start : i_end + 1]
-    model_slice = slice(i_start, i_end + 1)
 
     # Add time to new group
     new_wx = _create_station_group_with_attrs(new_h5, obs_h5, station_path, STATION_ATTRS_TO_COPY)
     _write_time_dataset_seconds(new_wx, time_in_period, time_origin, compression_lvl)
 
-    # get SFIRE data
-    Ny, Nx = xlat.shape
-    min_dlat = np.min(np.diff(xlat, axis=0))
-    min_dlon = np.min(np.diff(xlon, axis=1))
-    i_nearest, j_nearest = find_nearest_grid_point(
-        Nx, Ny, station_lat, station_lon, xlat, xlon, min_dlat, min_dlon
-    )
+    points = {}
+
+    def point(domain: WrfDomain):
+        """The output times of ``domain`` that frame the station's times, and its nearest grid point."""
+        if domain.number not in points:
+            time_sfire = _sfire_time_seconds(domain, offset_start)
+            i_start, i_end = _bracket_indices_inclusive(
+                time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1]
+            )
+            _validate_bracket(i_start, i_end, time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1])
+            xlat = domain.static("XLAT", grid_slice)
+            xlon = domain.static("XLONG", grid_slice)
+            Ny, Nx = xlat.shape
+            i_nearest, j_nearest = find_nearest_grid_point(
+                Nx,
+                Ny,
+                station_lat,
+                station_lon,
+                xlat,
+                xlon,
+                np.min(np.diff(xlat, axis=0)),
+                np.min(np.diff(xlon, axis=1)),
+            )
+            points[domain.number] = (
+                time_sfire[i_start : i_end + 1],
+                slice(i_start, i_end + 1),
+                j_nearest + grid_offset,
+                i_nearest + grid_offset,
+            )
+        return points[domain.number]
 
     def obs_sensor_height(variable: str) -> float:
         return (
@@ -360,7 +386,13 @@ def __process_weather_station(
             .magnitude
         )
 
-    def write(variable: str, raw: np.ndarray, units: str, prepared_height_m: float | None):
+    def write(
+        variable: str,
+        model_time: np.ndarray,
+        raw: np.ndarray,
+        units: str,
+        prepared_height_m: float | None,
+    ):
         var = new_wx.create_dataset(
             variable,
             data=_interp_linear_1d_strict(model_time, raw, time_in_period_sfire),
@@ -370,70 +402,94 @@ def __process_weather_station(
         if prepared_height_m is not None:
             write_model_sensor_height_metadata(var, Quantity(prepared_height_m, "m"))
 
-    def air_temperature():
+    def air_temperature(domain: WrfDomain):
         # Use T2 within interval 0m to 4m
         if not _sensor_height_check_ok(obs_sensor_height(svn.AIR_TEMPERATURE.value), 0, 4):
             raise ValueError("no method for a sensor height outside 0 m to 4 m")
+        model_time, model_slice, j, i = point(domain)
         print("Nearest T2")
-        write(svn.AIR_TEMPERATURE.value, wrf_dataset["T2"][model_slice, j_nearest, i_nearest], "degK", 2.0)
+        write(svn.AIR_TEMPERATURE.value, model_time, domain.series("T2", model_slice, j, i), "degK", 2.0)
 
-    def relative_humidity():
+    def relative_humidity(domain: WrfDomain):
         if not _sensor_height_check_ok(obs_sensor_height(svn.RELATIVE_HUMIDITY.value), 0, 4):
             raise ValueError("no method for a sensor height outside 0 m to 4 m")
+        model_time, model_slice, j, i = point(domain)
         print("Nearest RH2")
-        t2_raw = wrf_dataset["T2"][model_slice, j_nearest, i_nearest]
-        q2_raw = wrf_dataset["Q2"][model_slice, j_nearest, i_nearest]
-        psfc_raw = wrf_dataset["PSFC"][model_slice, j_nearest, i_nearest]
+        t2_raw = domain.series("T2", model_slice, j, i)
+        q2_raw = domain.series("Q2", model_slice, j, i)
+        psfc_raw = domain.series("PSFC", model_slice, j, i)
         write(
-            svn.RELATIVE_HUMIDITY.value, _rh_from_wrf_q2_t2_psfc(q2_raw, t2_raw, psfc_raw), "percent", 2.0
+            svn.RELATIVE_HUMIDITY.value,
+            model_time,
+            _rh_from_wrf_q2_t2_psfc(q2_raw, t2_raw, psfc_raw),
+            "percent",
+            2.0,
         )
 
-    def wind_direction():
+    def wind_direction(domain: WrfDomain):
         wd_sensor_height = obs_sensor_height(svn.WIND_DIRECTION.value)
         if not _sensor_height_check_ok(wd_sensor_height, 0, 20):
             raise ValueError("no method for a sensor height outside 0 m to 20 m")
+        model_time, model_slice, j, i = point(domain)
         print("Nearest WD10 used for WD measured between 0m and 20m")
-        u10_raw = wrf_dataset["U10"][model_slice, j_nearest, i_nearest]
-        v10_raw = wrf_dataset["V10"][model_slice, j_nearest, i_nearest]
-        cosalpha_raw, sinalpha_raw = _get_wind_rotation(wrf_dataset, model_slice, j_nearest, i_nearest)
+        u10_raw = domain.series("U10", model_slice, j, i)
+        v10_raw = domain.series("V10", model_slice, j, i)
+        cosalpha_raw, sinalpha_raw = _get_wind_rotation(domain, model_slice, j, i)
         u_true = u10_raw * cosalpha_raw - v10_raw * sinalpha_raw
         v_true = u10_raw * sinalpha_raw + v10_raw * cosalpha_raw
         # The log profile that scales the wind speed keeps its direction: the 10 m direction
         # is the direction at the sensor height.
-        write(svn.WIND_DIRECTION.value, wind_dir_from_uv(u_true, v_true), "degree", wd_sensor_height)
-
-    def wind_speed_at_sensor():
-        sensor_height = obs_sensor_height(svn.WIND_SPEED.value)
-        fxlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-        fxlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
-        Nyf, Nxf = fxlat.shape
-        if_nearest, jf_nearest = find_nearest_grid_point(
-            Nxf,
-            Nyf,
-            station_lat,
-            station_lon,
-            fxlat,
-            fxlon,
-            np.min(np.diff(fxlat, axis=0)),
-            np.min(np.diff(fxlon, axis=1)),
-        )
-        print("Nearest WS10 with S10 scaling")
-        u10_raw = wrf_dataset["U10"][model_slice, j_nearest, i_nearest]
-        v10_raw = wrf_dataset["V10"][model_slice, j_nearest, i_nearest]
-        s10 = wind_speed(u10_raw, v10_raw)
-        z0 = wrf_dataset["WZ0"][model_slice, jf_nearest, if_nearest]
         write(
-            svn.WIND_SPEED.value, wind_from10m_with_roughness(s10, sensor_height, z0), "m/s", sensor_height
+            svn.WIND_DIRECTION.value,
+            model_time,
+            wind_dir_from_uv(u_true, v_true),
+            "degree",
+            wd_sensor_height,
+        )
+
+    def wind_speed_at_sensor(domain: WrfDomain):
+        sensor_height = obs_sensor_height(svn.WIND_SPEED.value)
+        model_time, model_slice, j, i = point(domain)
+        u10_raw = domain.series("U10", model_slice, j, i)
+        v10_raw = domain.series("V10", model_slice, j, i)
+        s10 = wind_speed(u10_raw, v10_raw)
+        if domain.has_fire_grid() and domain.has("WZ0"):
+            fxlat = domain.static("FXLAT", grid_slice)
+            fxlon = domain.static("FXLONG", grid_slice)
+            Nyf, Nxf = fxlat.shape
+            if_nearest, jf_nearest = find_nearest_grid_point(
+                Nxf,
+                Nyf,
+                station_lat,
+                station_lon,
+                fxlat,
+                fxlon,
+                np.min(np.diff(fxlat, axis=0)),
+                np.min(np.diff(fxlon, axis=1)),
+            )
+            print("Nearest WS10 with S10 scaling (fire grid roughness WZ0)")
+            z0 = domain.series("WZ0", model_slice, jf_nearest + grid_offset, if_nearest + grid_offset)
+        else:
+            # A domain without a fire grid has no WZ0: the atmospheric roughness length instead.
+            print("Nearest WS10 with S10 scaling (atmospheric roughness ZNT)")
+            z0 = domain.series("ZNT", model_slice, j, i)
+        write(
+            svn.WIND_SPEED.value,
+            model_time,
+            wind_from10m_with_roughness(s10, sensor_height, z0),
+            "m/s",
+            sensor_height,
         )
         # For debug
-        write("WS10", s10, "m/s", None)
+        write("WS10", model_time, s10, "m/s", None)
 
-    def fmc_10h():
+    def fmc_10h(domain: WrfDomain):
+        model_time, model_slice, j, i = point(domain)
         if i_fmc_10h is None:
-            fmc10h_raw = wrf_dataset["FMC_GC"][model_slice, j_nearest, i_nearest]
+            fmc10h_raw = domain.series("FMC_GC", model_slice, j, i)
         else:
-            fmc10h_raw = wrf_dataset["FMC_GC"][model_slice, i_fmc_10h, j_nearest, i_nearest]
-        write(svn.FUEL_MOISTURE_CONTENT_10H.value, fmc10h_raw, "dimensionless", None)
+            fmc10h_raw = domain.series("FMC_GC", model_slice, i_fmc_10h, j, i)
+        write(svn.FUEL_MOISTURE_CONTENT_10H.value, model_time, fmc10h_raw, "dimensionless", None)
 
     station = obs_h5[station_path]
     written = 0
@@ -447,11 +503,18 @@ def __process_weather_station(
         if variable not in station.keys():
             continue
         print(f"Process {variable}")
-        try:
-            process()
+        errors = []
+        for domain in candidates:
+            try:
+                process(domain)
+            except SKIPPABLE_ERRORS as exc:
+                errors.append(exc)
+                continue
+            print(f"{variable} from {domain.name}")
             written += 1
-        except SKIPPABLE_ERRORS as exc:
-            skip(f"{station_path}/{variable}", exc)
+            break
+        else:
+            skip(f"{station_path}/{variable}", errors[0])
     if not written:
         del new_h5[station_path]
 
@@ -459,8 +522,8 @@ def __process_weather_station(
 def get_weather_stations(
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
-    sfire_ref_time: str,
+    wrf_dataset: WrfRun | Dataset,
+    sfire_ref_time: str | None,
     period_start_dt: datetime,
     period_end_dt: datetime,
     fire_grid_bound: int = 25,
@@ -469,6 +532,11 @@ def get_weather_stations(
 ):
     """Sample WRF-SFIRE weather variables at observation stations.
 
+    ``wrf_dataset`` is a run (``open_run``: every wrfout file of every domain) or one open wrfout
+    file. A station takes each variable from the finest domain that holds it and gives the variable;
+    its times come from the finest domain whose output covers one of them. ``sfire_ref_time``, the
+    time XTIME counts from, defaults to the run's ``SIMULATION_START_DATE``.
+
     ``i_fmc_10h`` is the zero-based fuel-layer index for 10-hour fuel moisture
     in a 4D ``FMC_GC`` field (time, fuel layer, y, x), defaulting to 1. Set it
     to ``None`` for a 3D field (time, y, x) containing only 10-hour fuel moisture.
@@ -476,6 +544,9 @@ def get_weather_stations(
     A station or a variable the simulation cannot give is left out with a ``SkippedWarning``, and
     a station keeps only the observation times the simulation covers.
     """
+    run = as_run(wrf_dataset)
+    if sfire_ref_time is None:
+        sfire_ref_time = run.start_time()
     origin = _datetime_fromisoformat_utc(sfire_ref_time)
     for ts in obs_h5[f"{fs.TIME_SERIES}"].keys():
         if ts.startswith("station_"):
@@ -485,7 +556,7 @@ def get_weather_stations(
                 __process_weather_station(
                     new_h5,
                     obs_h5,
-                    wrf_dataset,
+                    run,
                     station_path,
                     origin,
                     period_start_dt,

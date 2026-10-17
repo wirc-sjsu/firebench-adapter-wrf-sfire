@@ -3,9 +3,9 @@ import numpy as np
 import hdf5plugin
 import h5py
 from netCDF4 import Dataset
-from firebench.adapter_common.interpolation import nearest_2d
 
 from ._grid import fire_grid_slice
+from ._wrfout import WrfRun, as_run, nearest_by_domain
 
 # Threshold for burn severity
 # <= SEVERITY_TH[0]: high (4)
@@ -38,7 +38,7 @@ def get_mtbs_severity_surf(
     new_h5: h5py.File,
     obs_h5: h5py.File,
     mtbs_group_path: str,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun | Dataset,
     method: str = "fuel_frac",
     severity_thresholds: np.ndarray = SEVERITY_TH_DEFAULT,
     fire_grid_bound: int = 25,
@@ -63,19 +63,21 @@ def get_mtbs_severity_surf(
 
     # get SFIRE data
     grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
+    domains = as_run(wrf_dataset).fire_domains()
 
-    Ny, Nx = xlat.shape
     # get data from std file
     mtbs_lat = obs_h5[f"{mtbs_group_path}/position_lat"][:, :]
     mtbs_lon = obs_h5[f"{mtbs_group_path}/position_lon"][:, :]
     mtbs_crs = obs_h5[f"{mtbs_group_path}"].attrs["crs"]
 
     if method == "fuel_frac":
-        fuel_frac = np.array(wrf_dataset["FUEL_FRAC"][-1, grid_slice, grid_slice])
-        SFIRE_severity = __compute_severity_from_fuel_frac(Nx, Ny, fuel_frac, severity_thresholds)
-        severity_interp = nearest_2d(SFIRE_severity, xlon, xlat, mtbs_lon, mtbs_lat)
+
+        def severity(domain):
+            fuel_frac = np.array(domain.last("FUEL_FRAC", grid_slice))
+            Ny, Nx = fuel_frac.shape
+            return __compute_severity_from_fuel_frac(Nx, Ny, fuel_frac, severity_thresholds)
+
+        severity_interp = nearest_by_domain(domains, mtbs_lat, mtbs_lon, grid_slice, severity)
         __write_group_new_file(severity_interp)
         return
 

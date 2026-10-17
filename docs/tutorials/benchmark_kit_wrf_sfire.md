@@ -22,20 +22,23 @@ FBF-0001_mccully-fire_2026.0-dev2/
 
 ## 2. Run WRF-SFIRE over the frame and the window
 
-The kit's `README.md` gives the box and the window. The weather stations outside the atmospheric grid
-are skipped, so a domain that holds the stations of the case scores more of them.
+The kit's `README.md` gives the box and the window. The weather stations outside every atmospheric
+grid are skipped, so domains that hold the stations of the case score more of them.
+
+With several domains, the adapter takes each value from the finest domain that holds the point (the
+highest `dNN`), and the next domain otherwise: a station outside the fire domain `d02` but inside
+`d01` is sampled on `d01`. Perimeters come from the finest domain with a fire grid.
 
 ## 3. Fill in the config
 
-Open `adapters/wrf-sfire.yaml` and change the three lines marked `CHANGE_ME`:
+Open `adapters/wrf-sfire.yaml` and change the two lines marked `CHANGE_ME`:
 
 ```yaml
 main:
   template_path: ../template.h5
-  wrf_path: /path/to/wrfout_d01_2026-08-21_00:00:00   # CHANGE_ME
+  wrf_path: /path/to/the/run                          # CHANGE_ME: its folder, or one wrfout file
   output_path: ../output/FBF-0001_WRF-SFIRE.h5
   authors: "Collaborator Name, Institution;"          # CHANGE_ME
-  sfire_ref_time: "2026-08-21T00:00:00Z"              # CHANGE_ME: the time TIGN_G counts from
   start_dt: '2026-08-22T00:00:00Z'
   end_dt: '2026-09-15T00:00:00Z'
 case:
@@ -55,8 +58,10 @@ weather:
   enabled: true
 ```
 
-Relative paths are resolved from the folder of the config. `sfire_ref_time` needs a timezone offset
-(`Z` is UTC). The other sections and keys of the Caldor tutorial (`overwrite`, `fire_grid_bound`,
+Relative paths are resolved from the folder of the config. `wrf_path` is the folder that holds the
+run's `wrfout_dNN_*` files (the adapter finds them, every domain), or one wrfout file. The time
+`XTIME` and `TIGN_G` count from is the run's `SIMULATION_START_DATE`; to give another, add
+`sfire_ref_time`, with a timezone offset (`Z` is UTC). The other sections and keys of the Caldor tutorial (`overwrite`, `fire_grid_bound`,
 `weather.i_fmc_10h`, …) work here too.
 
 `main.template_path` and `main.obs_path` cannot both be given. When the template holds a case

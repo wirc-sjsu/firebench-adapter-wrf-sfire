@@ -37,13 +37,13 @@ Relative paths in the config are resolved from the directory containing `config.
 ```yaml
 main:
   obs_path: /path/to/firebench-data/Caldor.h5
-  wrf_path: /path/to/wrf-sfire/wrfout
+  wrf_path: /path/to/wrf-sfire/run   # the folder of wrfout_dNN_* files, or one wrfout file
   output_path: outputs/SFIRE_Caldor.h5
   authors: "Collaborator Name, Institution;"
   overwrite: true
   compression_lvl: 20
   fire_grid_bound: 25
-  sfire_ref_time: "2021-08-21T00:00-00:00"
+  sfire_ref_time: "2021-08-21T00:00-00:00"   # optional: SIMULATION_START_DATE of the run by default
   start_dt: "2021-08-21T00:00:00+00:00"
   end_dt: "2021-08-23T00:00:00+00:00"
 

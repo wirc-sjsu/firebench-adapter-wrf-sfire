@@ -3,9 +3,9 @@ import numpy as np
 import hdf5plugin
 import h5py
 from netCDF4 import Dataset
-from firebench.adapter_common.interpolation import nearest_2d
 
 from ._grid import fire_grid_slice
+from ._wrfout import WrfRun, as_run, nearest_by_domain
 
 CBI_DATASET = "ravg_composite_burn_index_severity"
 
@@ -39,7 +39,7 @@ def get_ravg_cbi_severity(
     new_h5: h5py.File,
     ref_h5: h5py.File,
     cbi_group_path: str,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun | Dataset,
     method: str = "fuel_frac",
     cbi_thresholds: np.ndarray = CBI_TH_DEFAULT,
     fire_grid_bound: int = 25,
@@ -48,7 +48,8 @@ def get_ravg_cbi_severity(
     """Write RAVG CBI4 classes on the grid of ``cbi_group_path`` in ``ref_h5``.
 
     ``ref_h5`` is an observation file or a benchmark kit's template. A cell of its grid outside the
-    fire grid takes the reference's ``_FillValue``, which FireBench leaves out.
+    fire grids takes the reference's ``_FillValue``, which FireBench leaves out. A cell takes the finest
+    fire grid that holds it.
     """
     ref_cbi = ref_h5[f"{cbi_group_path}/{CBI_DATASET}"]
     fill_value = ref_cbi.attrs["_FillValue"]
@@ -72,22 +73,24 @@ def get_ravg_cbi_severity(
 
     # get SFIRE data
     grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
+    domains = as_run(wrf_dataset).fire_domains()
 
-    Ny, Nx = xlat.shape
     # get grid from reference file
     ref_lat = ref_h5[f"{cbi_group_path}/position_lat"][:, :]
     ref_lon = ref_h5[f"{cbi_group_path}/position_lon"][:, :]
     ref_crs = ref_h5[f"{cbi_group_path}"].attrs["crs"]
-    outside = (
-        (ref_lat < xlat.min()) | (ref_lat > xlat.max()) | (ref_lon < xlon.min()) | (ref_lon > xlon.max())
-    )
+    outside = np.ones(ref_lat.shape, dtype=bool)
+    for domain in domains:
+        outside &= ~domain.covers(ref_lat, ref_lon, grid_slice, fire=True)
 
     if method == "fuel_frac":
-        fuel_frac = np.array(wrf_dataset["FUEL_FRAC"][-1, grid_slice, grid_slice])
-        SFIRE_cbi4 = __compute_cbi4_from_fuel_frac(Nx, Ny, fuel_frac, cbi_thresholds)
-        cbi4_interp = nearest_2d(SFIRE_cbi4, xlon, xlat, ref_lon, ref_lat)
+
+        def cbi4(domain):
+            fuel_frac = np.array(domain.last("FUEL_FRAC", grid_slice))
+            Ny, Nx = fuel_frac.shape
+            return __compute_cbi4_from_fuel_frac(Nx, Ny, fuel_frac, cbi_thresholds)
+
+        cbi4_interp = nearest_by_domain(domains, ref_lat, ref_lon, grid_slice, cbi4)
         cbi4_interp[outside] = fill_value
         __write_group_new_file(cbi4_interp)
         return

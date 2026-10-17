@@ -52,7 +52,8 @@ fb-sfire run config.yml
 ```
 
 The config contains a `main` section for shared paths and times, plus dedicated sections such as
-`severity`, `building_damage`, `ravg_cc`, `perimeters`, and `weather`.
+`severity`, `building_damage`, `ravg_cc`, `perimeters`, and `weather`. `main.wrf_path` is the folder
+of the run (every `wrfout_dNN_*` file, each value from the finest domain that holds it) or one file.
 
 To enter a benchmark case of the FireBench Foundation site (`FBF-` cases), download the case's
 benchmark kit with the WRF-SFIRE adapter chosen, then run `fb-sfire run adapters/wrf-sfire.yaml`; see

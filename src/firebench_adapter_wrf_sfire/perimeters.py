@@ -13,6 +13,7 @@ from scipy.ndimage import gaussian_filter
 from shapely.geometry import Polygon
 
 from ._skip import skip
+from ._wrfout import WrfRun, as_run
 
 PERIMETER_EXTRACTION_METHOD_TIGN_G = "tign_g"
 PERIMETER_EXTRACTION_METHOD_BURNED_MASK = "burned_mask"
@@ -206,9 +207,9 @@ def _extract_perimeter_geopolygons(
 def get_perimeters_from_t_ign_g(
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun | Dataset,
     list_perimeter_paths: list[str],
-    t_ign_g_ref_time: str,
+    t_ign_g_ref_time: str | None,
     fire_grid_bound: int = 25,
     kml_dir: str = "kml",
     overwrite: bool = False,
@@ -220,21 +221,29 @@ def get_perimeters_from_t_ign_g(
             f"Unknown perimeter extraction method {extraction_method!r}. "
             f"Available methods: {', '.join(PERIMETER_EXTRACTION_METHODS)}"
         )
+    run = as_run(wrf_dataset)
+    # A contour cannot be stitched across grids: the perimeters come from the finest fire grid.
+    domains = run.fire_domains()
+    if not domains:
+        raise ValueError("no domain of the run has a fire grid")
+    domain = domains[0]
+    if t_ign_g_ref_time is None:
+        t_ign_g_ref_time = run.start_time()
     Path(kml_dir).mkdir(parents=True, exist_ok=True)
     origin_raw = datetime.fromisoformat(t_ign_g_ref_time.replace("Z", "+00:00"))
     origin = _as_utc_datetime(origin_raw)
     grid_slice = _fire_grid_slice(fire_grid_bound)
 
-    xlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
-    t_ign_g = wrf_dataset["TIGN_G"][-1, grid_slice, grid_slice]
+    xlat = domain.static("FXLAT", grid_slice)
+    xlon = domain.static("FXLONG", grid_slice)
+    t_ign_g = domain.last("TIGN_G", grid_slice)
     valid_t_ign_g = _valid_tign_g_values(t_ign_g)
     if valid_t_ign_g.size == 0:
         raise ValueError("TIGN_G contains no finite values in the selected fire grid.")
     min_t_ign_g = float(np.min(valid_t_ign_g))
     max_t_ign_g = float(np.max(valid_t_ign_g))
     # TIGN_G is read at the last output time, the horizon of the simulation (XTIME, in minutes).
-    horizon_s = float(wrf_dataset["XTIME"][-1]) * 60 if "XTIME" in wrf_dataset.variables else None
+    horizon_s = float(domain.xtime()[-1]) * 60 if domain.has("XTIME") else None
 
     for perim_path in list_perimeter_paths:
         try:

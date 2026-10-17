@@ -5,13 +5,14 @@ from netCDF4 import Dataset
 from firebench.adapter_common.interpolation import find_nearest_grid_point
 
 from ._grid import fire_grid_slice
+from ._wrfout import WrfRun, as_run, point_owners
 
 
 def get_building_damage(
     new_h5: h5py.File,
     obs_h5: h5py.File,
     bd_group_path: str,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun | Dataset,
     method: str = "fire_area",
     fire_grid_bound: int = 25,
     compression_lvl: int = 3,
@@ -36,19 +37,34 @@ def get_building_damage(
 
     # get SFIRE data
     grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
-    Ny, Nx = xlat.shape
-    min_dlat = np.min(np.diff(xlat, axis=0))
-    min_dlon = np.min(np.diff(xlon, axis=1))
+    domains = as_run(wrf_dataset).fire_domains()
+    if not domains:
+        raise ValueError("no domain of the run has a fire grid")
 
     building_lat = obs_h5[f"{bd_group_path}/position_lat"][:]
     building_lon = obs_h5[f"{bd_group_path}/position_lon"][:]
     building_damaged = np.array(obs_h5[f"{bd_group_path}/building_damage"][:], dtype="U")
     N_buildings = len(building_lat)
+    # A building takes the finest fire grid that holds it.
+    owners = point_owners(domains, building_lat, building_lon, grid_slice, fire=True)
 
     if method == "fire_area":
-        fire_area = np.array(wrf_dataset["FIRE_AREA"][-1, grid_slice, grid_slice])
+        grids = {}
+
+        def grid(index: int):
+            if index not in grids:
+                domain = domains[index]
+                xlat = domain.static("FXLAT", grid_slice)
+                xlon = domain.static("FXLONG", grid_slice)
+                grids[index] = (
+                    xlat,
+                    xlon,
+                    np.min(np.diff(xlat, axis=0)),
+                    np.min(np.diff(xlon, axis=1)),
+                    np.array(domain.last("FIRE_AREA", grid_slice)),
+                )
+            return grids[index]
+
         sfire_building_damaged = []
         for k in range(N_buildings):
             print(f"{k+1}/{N_buildings}")
@@ -56,6 +72,8 @@ def get_building_damage(
                 sfire_building_damaged.append("Inaccessible")
                 continue
 
+            xlat, xlon, min_dlat, min_dlon, fire_area = grid(owners[k])
+            Ny, Nx = xlat.shape
             i_nearest, j_nearest = find_nearest_grid_point(
                 Nx, Ny, building_lat[k], building_lon[k], xlat, xlon, min_dlat, min_dlon
             )

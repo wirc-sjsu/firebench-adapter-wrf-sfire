@@ -216,7 +216,7 @@ def test_weather_keeps_what_the_simulation_gives(kit):
         "WARNING: time_series/station_after skipped: no observation time inside the simulation"
         in result.output
     )
-    assert "WARNING: time_series/station_out skipped: outside the model domain" in result.output
+    assert "WARNING: time_series/station_out skipped: outside every model domain" in result.output
     assert "3 item(s) skipped" in result.output
     with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
         late = out_h5[f"{TIME_SERIES}/station_late"]

@@ -3,9 +3,9 @@ import numpy as np
 import hdf5plugin
 import h5py
 from netCDF4 import Dataset
-from firebench.adapter_common.interpolation import nearest_2d
 
 from ._grid import fire_grid_slice
+from ._wrfout import WrfRun, as_run, nearest_by_domain
 
 
 @njit(fastmath=True)
@@ -33,7 +33,7 @@ def get_ravg_cc(
     new_h5: h5py.File,
     obs_h5: h5py.File,
     ravg_group_path: str,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun | Dataset,
     method: str = "cfb",
     fire_grid_bound: int = 25,
     compression_lvl: int = 3,
@@ -57,24 +57,26 @@ def get_ravg_cc(
 
     # get SFIRE data
     grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
+    domains = as_run(wrf_dataset).fire_domains()
 
-    Ny, Nx = xlat.shape
     # get data from std file
     obs_lat = obs_h5[f"{ravg_group_path}/position_lat"][:, :]
     obs_lon = obs_h5[f"{ravg_group_path}/position_lon"][:, :]
     obs_crs = obs_h5[f"{ravg_group_path}"].attrs["crs"]
 
     if method == "cfb":
-        fire_area = np.array(wrf_dataset["FIRE_AREA"][-1, grid_slice, grid_slice])
-        try:
-            cfb = np.array(wrf_dataset["CFB"][-1, grid_slice, grid_slice])
-        except:
-            print("WARNING: CFB not found in wrfout file. Replaced by zeros.")
-            cfb = np.zeros_like(fire_area)
-        SFIRE_canopy_cover_loss = __compute_canopy_cover_loss_from_cfb(Nx, Ny, fire_area, cfb)
-        ccl_interp = nearest_2d(SFIRE_canopy_cover_loss, xlon, xlat, obs_lon, obs_lat)
+
+        def canopy_cover_loss(domain):
+            fire_area = np.array(domain.last("FIRE_AREA", grid_slice))
+            try:
+                cfb = np.array(domain.last("CFB", grid_slice))
+            except:
+                print("WARNING: CFB not found in wrfout file. Replaced by zeros.")
+                cfb = np.zeros_like(fire_area)
+            Ny, Nx = fire_area.shape
+            return __compute_canopy_cover_loss_from_cfb(Nx, Ny, fire_area, cfb)
+
+        ccl_interp = nearest_by_domain(domains, obs_lat, obs_lon, grid_slice, canopy_cover_loss)
         __write_group_new_file(ccl_interp)
         return
 

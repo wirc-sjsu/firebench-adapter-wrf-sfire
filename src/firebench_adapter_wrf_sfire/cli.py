@@ -9,7 +9,6 @@ import click
 import h5py
 import numpy as np
 import yaml
-from netCDF4 import Dataset
 
 import firebench.standardize as fs
 from firebench_adapter_wrf_sfire import (
@@ -21,6 +20,7 @@ from firebench_adapter_wrf_sfire import (
     get_weather_stations,
 )
 from firebench_adapter_wrf_sfire._skip import SkippedWarning, skip
+from firebench_adapter_wrf_sfire._wrfout import WrfRun, open_run
 from firebench_adapter_wrf_sfire.perimeters import PERIMETER_EXTRACTION_METHODS
 
 DEFAULT_COMPRESSION_LVL = 3
@@ -58,8 +58,10 @@ def run(config_yml: Path) -> None:
     compression_lvl = int(main_config.get("compression_lvl", DEFAULT_COMPRESSION_LVL))
     fire_grid_bound = int(main_config.get("fire_grid_bound", DEFAULT_FIRE_GRID_BOUND))
 
-    if not wrf_path.is_file():
-        raise click.UsageError(f"WRF-SFIRE file does not exist: {wrf_path}")
+    if not wrf_path.exists():
+        raise click.UsageError(
+            f"WRF-SFIRE output does not exist: {wrf_path} (give a wrfout file or the folder of the run)"
+        )
 
     _check_case(config, obs_path)
 
@@ -68,30 +70,91 @@ def run(config_yml: Path) -> None:
     end_dt = _optional_datetime(main_config, "end_dt")
 
     if _section_enabled(config, "perimeters"):
-        if sfire_ref_time is None:
-            raise click.UsageError("main.sfire_ref_time is required when perimeters.enabled is true.")
         extraction_method = _optional_mapping(config, "perimeters").get("extraction_method", "tign_g")
         if extraction_method not in PERIMETER_EXTRACTION_METHODS:
             raise click.UsageError(
                 f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
             )
     if _section_enabled(config, "weather"):
-        if sfire_ref_time is None:
-            raise click.UsageError("main.sfire_ref_time is required when weather.enabled is true.")
         if start_dt is None or end_dt is None:
             raise click.UsageError(
                 "main.start_dt and main.end_dt are required when weather.enabled is true."
             )
 
+    if output_path.exists() and not overwrite:
+        raise click.UsageError(f"Output file already exists: {output_path}")
     try:
-        new_h5 = fs.new_std_file(str(output_path), authors, overwrite=overwrite)
-    except FileExistsError as exc:
-        raise click.UsageError(f"Output file already exists: {output_path}") from exc
+        run_files = open_run(wrf_path)
+    except (OSError, ValueError) as exc:
+        raise click.UsageError(f"Cannot read the WRF-SFIRE output {wrf_path}: {exc}") from exc
+    with run_files:
+        sfire_ref_time = _run_ref_time(run_files, sfire_ref_time, config)
+        try:
+            new_h5 = fs.new_std_file(str(output_path), authors, overwrite=overwrite)
+        except FileExistsError as exc:
+            raise click.UsageError(f"Output file already exists: {output_path}") from exc
+        caught = _run_sections(
+            config,
+            config_dir,
+            new_h5,
+            obs_path,
+            run_files,
+            sfire_ref_time,
+            start_dt,
+            end_dt,
+            fire_grid_bound,
+            compression_lvl,
+            overwrite,
+        )
 
+    skipped = [item for item in caught if issubclass(item.category, SkippedWarning)]
+    for item in caught:
+        if not issubclass(item.category, SkippedWarning):
+            warnings.showwarning(item.message, item.category, item.filename, item.lineno)
+    click.echo(f"Wrote {output_path}")
+    if skipped:
+        click.echo(
+            f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
+            err=True,
+        )
+
+
+def _run_ref_time(run_files: WrfRun, sfire_ref_time: str | None, config: dict[str, Any]) -> str | None:
+    """Echo the domains of the run, and give sfire_ref_time, from the run when the config has none."""
+    for domain in run_files.domains:
+        click.echo(f"WRF-SFIRE domain {domain.describe()}")
+    if sfire_ref_time is not None:
+        return sfire_ref_time
+    if not (_section_enabled(config, "perimeters") or _section_enabled(config, "weather")):
+        return None
+    try:
+        sfire_ref_time = run_files.start_time()
+    except ValueError as exc:
+        raise click.UsageError(
+            f"main.sfire_ref_time is required: the WRF-SFIRE output does not give it ({exc})."
+        ) from exc
+    click.echo(f"sfire_ref_time {sfire_ref_time}, the start of the run (SIMULATION_START_DATE)")
+    return sfire_ref_time
+
+
+def _run_sections(  # pylint: disable=too-many-arguments
+    config: dict[str, Any],
+    config_dir: Path,
+    new_h5: h5py.File,
+    obs_path: Path,
+    wrf_dataset: WrfRun,
+    sfire_ref_time: str | None,
+    start_dt: datetime | None,
+    end_dt: datetime | None,
+    fire_grid_bound: int,
+    compression_lvl: int,
+    overwrite: bool,
+) -> list[warnings.WarningMessage]:
+    """Run every enabled section into ``new_h5``, close it, and return the warnings they raised."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", SkippedWarning)
         try:
-            with h5py.File(obs_path, "r") as obs_h5, Dataset(wrf_path, "r") as wrf_dataset:
+            with h5py.File(obs_path, "r") as obs_h5:
                 common = (new_h5, obs_h5, wrf_dataset)
                 sections = (
                     ("severity", lambda: _run_severity(config, *common, fire_grid_bound, compression_lvl)),
@@ -132,17 +195,7 @@ def run(config_yml: Path) -> None:
                     shown = _echo_skipped(caught, shown)
         finally:
             new_h5.close()
-
-    skipped = [item for item in caught if issubclass(item.category, SkippedWarning)]
-    for item in caught:
-        if not issubclass(item.category, SkippedWarning):
-            warnings.showwarning(item.message, item.category, item.filename, item.lineno)
-    click.echo(f"Wrote {output_path}")
-    if skipped:
-        click.echo(
-            f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
-            err=True,
-        )
+    return caught
 
 
 def _echo_skipped(caught: list[warnings.WarningMessage], shown: int) -> int:
@@ -307,7 +360,7 @@ def _run_severity(
     config: dict[str, Any],
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     fire_grid_bound: int,
     compression_lvl: int,
 ) -> None:
@@ -341,7 +394,7 @@ def _run_building_damage(
     config: dict[str, Any],
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     fire_grid_bound: int,
     compression_lvl: int,
 ) -> None:
@@ -365,7 +418,7 @@ def _run_ravg_cc(
     config: dict[str, Any],
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     fire_grid_bound: int,
     compression_lvl: int,
 ) -> None:
@@ -389,7 +442,7 @@ def _run_burn_severity_cbi(
     config: dict[str, Any],
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     fire_grid_bound: int,
     compression_lvl: int,
 ) -> None:
@@ -421,7 +474,7 @@ def _run_perimeters(
     config_dir: Path,
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     sfire_ref_time: str | None,
     fire_grid_bound: int,
     overwrite: bool,
@@ -454,7 +507,7 @@ def _run_weather(
     config: dict[str, Any],
     new_h5: h5py.File,
     obs_h5: h5py.File,
-    wrf_dataset: Dataset,
+    wrf_dataset: WrfRun,
     sfire_ref_time: str | None,
     start_dt: datetime | None,
     end_dt: datetime | None,

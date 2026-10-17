@@ -31,6 +31,8 @@ def test_public_api_exports_documented_functions():
         "get_ravg_cc",
         "get_ravg_cbi_severity",
         "get_weather_stations",
+        "open_run",
+        "WrfRun",
     ):
         assert name in adapter.__all__
 

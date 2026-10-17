@@ -29,7 +29,8 @@ class WrfDomain:
         self.datasets = datasets
         self._pieces: list[tuple[Dataset, np.ndarray, int]] | None = None
         self._xtime: np.ndarray | None = None
-        self._rings: dict[tuple[str, str, slice], shapely.Polygon] = {}
+        # Keyed by the bounds of the slice: a slice is hashable only from Python 3.12.
+        self._rings: dict[tuple[str, str, int | None, int | None], shapely.Polygon] = {}
 
     @property
     def name(self) -> str:
@@ -40,11 +41,31 @@ class WrfDomain:
         """Whether the files of the domain hold ``variable``."""
         return variable in self.datasets[0].variables
 
+    def variable(self, name: str, dataset: Dataset | None = None, ndim: int | None = None):
+        """The netCDF variable ``name``, refused clearly when the output lacks it or lays it out otherwise.
+
+        A reduced output (WRF's ``iofields_filename``) leaves variables out; the error names the one
+        missing, and the section or the variable that needs it is skipped.
+        """
+        dataset = self.datasets[0] if dataset is None else dataset
+        if name not in dataset.variables:
+            raise KeyError(f"{name} is not in the output of {self.name}")
+        variable = dataset[name]
+        if ndim is not None and variable.ndim != ndim:
+            raise ValueError(
+                f"{name} of {self.name} has the dimensions {variable.dimensions}, not the {ndim} expected"
+            )
+        return variable
+
+    def ndim(self, name: str) -> int:
+        """The number of dimensions of ``name``, time included."""
+        return self.variable(name).ndim
+
     def has_fire_grid(self) -> bool:
         """Whether the domain runs the fire model: a domain without one writes FXLAT as zeros."""
         if not self.has("FXLAT"):
             return False
-        fxlat = np.asarray(self.datasets[0]["FXLAT"][0])
+        fxlat = np.asarray(self.variable("FXLAT", ndim=3)[0])
         return fxlat.size > 1 and float(np.ptp(fxlat)) > 0
 
     def xtime(self) -> np.ndarray:
@@ -52,7 +73,7 @@ class WrfDomain:
         if self._xtime is None:
             pieces, times, first = [], [], 0
             for dataset in self.datasets:
-                xtime = np.asarray(dataset["XTIME"][:], dtype=np.float64)
+                xtime = np.asarray(self.variable("XTIME", dataset, 1)[:], dtype=np.float64)
                 local = np.flatnonzero(xtime > times[-1][-1]) if times else np.arange(xtime.size)
                 if local.size and np.any(np.diff(xtime[local]) <= 0):
                     raise ValueError(f"XTIME of {dataset.filepath()} is not increasing")
@@ -66,11 +87,11 @@ class WrfDomain:
 
     def static(self, variable: str, grid_slice: slice) -> np.ndarray:
         """A field that does not change in time (grid coordinates), from the first output time."""
-        return np.array(self.datasets[0][variable][0, grid_slice, grid_slice])
+        return np.array(self.variable(variable, ndim=3)[0, grid_slice, grid_slice])
 
     def last(self, variable: str, grid_slice: slice):
         """A field at the last output time of the run, as netCDF4 reads it."""
-        return self.datasets[-1][variable][-1, grid_slice, grid_slice]
+        return self.variable(variable, self.datasets[-1], 3)[-1, grid_slice, grid_slice]
 
     def series(self, variable: str, time_slice: slice, *point: int) -> np.ndarray:
         """The values of ``variable`` at ``point`` (layer, j, i or j, i) over ``time_slice`` of xtime()."""
@@ -82,14 +103,16 @@ class WrfDomain:
             if low >= high:
                 continue
             indices = local[low - first : high - first]
-            values = dataset[variable][(slice(indices[0], indices[-1] + 1),) + point]
+            values = self.variable(variable, dataset, 1 + len(point))[
+                (slice(indices[0], indices[-1] + 1),) + point
+            ]
             parts.append(np.ma.getdata(values)[indices - indices[0]])
         return np.concatenate(parts)
 
     def covers(self, lat, lon, grid_slice: slice, fire: bool = False) -> np.ndarray:
         """Whether each point is inside the trimmed atmospheric grid (or fire grid), its edge included."""
         lat_name, lon_name = ("FXLAT", "FXLONG") if fire else ("XLAT", "XLONG")
-        key = (lat_name, lon_name, grid_slice)
+        key = (lat_name, lon_name, grid_slice.start, grid_slice.stop)
         if key not in self._rings:
             lats = self.static(lat_name, grid_slice)
             lons = self.static(lon_name, grid_slice)

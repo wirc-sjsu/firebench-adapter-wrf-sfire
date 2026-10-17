@@ -45,13 +45,16 @@ def _write_wrfout(path, xtime, lat, lon, fields, fire=True):
             )
 
 
-def _write_run(folder, d01_fire=False):
+def _write_run(folder, d01_fire=False, drop=()):
     """d01: 9x9 cells of 1 degree, one file, hourly. d02: 5x5 cells of 0.25 degree, three files
     every 30 minutes, the second starting with the last time of the first, as after a restart."""
     folder.mkdir(parents=True, exist_ok=True)
     common = {"U10": 3.0, "V10": 4.0, "ZNT": 0.1}
     d01 = {**common, "T2": lambda t: 280.0 + t, "FMC_GC": 0.1, "FUEL_FRAC": 0.9, "FIRE_AREA": 0.0}
     d02 = {**common, "T2": lambda t: 300.0 + t, "WZ0": 0.5, "FUEL_FRAC": 0.1, "FIRE_AREA": 1.0}
+    # A reduced output (WRF's iofields_filename) leaves variables out.
+    d01 = {name: value for name, value in d01.items() if name not in drop}
+    d02 = {name: value for name, value in d02.items() if name not in drop}
     lat1, lon1 = _grid(36.0, -125.0, 9, 1.0)
     lat2, lon2 = _grid(38.5, -121.5, 5, 0.25)
     _write_wrfout(folder / "wrfout_d01_2026-01-01_00:00:00", [0.0, 60.0, 120.0], lat1, lon1, d01, d01_fire)
@@ -181,7 +184,7 @@ def test_a_point_beyond_the_corners_of_a_rotated_grid_is_outside(tmp_path):
 
 def test_weather_takes_each_station_from_the_finest_domain_that_gives_it(case):
     _write_run(case / "run")
-    config_path = _config(case, case / "run", weather={"enabled": True, "i_fmc_10h": None})
+    config_path = _config(case, case / "run", weather={"enabled": True})
 
     result = _run(config_path)
 
@@ -254,3 +257,60 @@ def test_a_station_reads_its_own_cell_when_the_grid_is_trimmed(case):
         # INNER (39, -121) is the cell j=2, i=2 of the full grid.
         temperature = out_h5[f"{TIME_SERIES}/station_inner/{svn.AIR_TEMPERATURE.value}"]
         np.testing.assert_allclose(temperature[:], np.full(5, 22.0))
+
+
+def test_a_reduced_output_skips_what_it_lacks_and_names_it(case):
+    _write_run(case / "run", drop=("FUEL_FRAC", "ZNT"))
+    config_path = _config(
+        case,
+        case / "run",
+        burn_severity_cbi={"enabled": True, "group_path": CBI_GROUP},
+        weather={"enabled": True},
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "WARNING: Section burn_severity_cbi skipped: 'FUEL_FRAC is not in the output of d02'"
+        in result.output
+    )
+    # d02 has WZ0; d01 has neither WZ0 nor ZNT.
+    assert (
+        "WARNING: time_series/station_outer/wind_speed skipped: "
+        "'no roughness length (WZ0 or ZNT) in the output of d01'" in result.output
+    )
+    with h5py.File(case / "output" / "model.h5", "r") as out_h5:
+        assert "spatial_2d" not in out_h5
+        assert svn.WIND_SPEED.value in out_h5[f"{TIME_SERIES}/station_inner"]
+        assert svn.AIR_TEMPERATURE.value in out_h5[f"{TIME_SERIES}/station_outer"]
+
+
+def test_a_field_laid_out_otherwise_is_skipped_with_its_dimensions(case):
+    lat, lon = _grid(38.0, -122.0, 6, 0.5)
+    _write_wrfout(case / "wrfout_d01_one", [0.0, 120.0], lat, lon, {})
+    with Dataset(case / "wrfout_d01_one", "a") as wrf:
+        wrf.createVariable("T2", "f8", ("south_north", "west_east"))[:] = 290.0
+    config_path = _config(case, case / "wrfout_d01_one", weather={"enabled": True})
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "time_series/station_inner/air_temperature skipped: T2 of d01 has the dimensions "
+        "('south_north', 'west_east'), not the 3 expected" in result.output
+    )
+
+
+def test_minus_o_replaces_an_existing_output(case):
+    _write_run(case / "run")
+    config_path = _config(case, case / "run", weather={"enabled": True})
+    assert _run(config_path).exit_code == 0
+
+    refused = _run(config_path)
+    replaced = CliRunner().invoke(main, ["run", "-o", str(config_path)])
+
+    assert refused.exit_code != 0
+    assert "Output file already exists" in refused.output
+    assert "run with -o to replace it" in refused.output
+    assert replaced.exit_code == 0, replaced.output

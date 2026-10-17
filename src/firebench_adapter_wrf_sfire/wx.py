@@ -469,10 +469,12 @@ def __process_weather_station(
             )
             print("Nearest WS10 with S10 scaling (fire grid roughness WZ0)")
             z0 = domain.series("WZ0", model_slice, jf_nearest + grid_offset, if_nearest + grid_offset)
-        else:
+        elif domain.has("ZNT"):
             # A domain without a fire grid has no WZ0: the atmospheric roughness length instead.
             print("Nearest WS10 with S10 scaling (atmospheric roughness ZNT)")
             z0 = domain.series("ZNT", model_slice, j, i)
+        else:
+            raise KeyError(f"no roughness length (WZ0 or ZNT) in the output of {domain.name}")
         write(
             svn.WIND_SPEED.value,
             model_time,
@@ -485,8 +487,13 @@ def __process_weather_station(
 
     def fmc_10h(domain: WrfDomain):
         model_time, model_slice, j, i = point(domain)
-        if i_fmc_10h is None:
+        if domain.ndim("FMC_GC") == 3:
+            # A postprocessed field holding the 10-hour class alone.
             fmc10h_raw = domain.series("FMC_GC", model_slice, j, i)
+        elif i_fmc_10h is None:
+            raise ValueError(
+                "FMC_GC has a fuel class dimension: set weather.i_fmc_10h to the 10-hour class"
+            )
         else:
             fmc10h_raw = domain.series("FMC_GC", model_slice, i_fmc_10h, j, i)
         write(svn.FUEL_MOISTURE_CONTENT_10H.value, model_time, fmc10h_raw, "dimensionless", None)
@@ -538,8 +545,8 @@ def get_weather_stations(
     time XTIME counts from, defaults to the run's ``SIMULATION_START_DATE``.
 
     ``i_fmc_10h`` is the zero-based fuel-layer index for 10-hour fuel moisture
-    in a 4D ``FMC_GC`` field (time, fuel layer, y, x), defaulting to 1. Set it
-    to ``None`` for a 3D field (time, y, x) containing only 10-hour fuel moisture.
+    in a 4D ``FMC_GC`` field (time, fuel layer, y, x), defaulting to 1. A 3D field
+    (time, y, x) holds only 10-hour fuel moisture and is read whatever ``i_fmc_10h`` is.
 
     A station or a variable the simulation cannot give is left out with a ``SkippedWarning``, and
     a station keeps only the observation times the simulation covers.

@@ -16,14 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Several domains: a weather station takes each variable from the finest domain that holds it and gives the variable, the next domain otherwise; the raster and building damage sections take each point from the finest domain with a fire grid that holds it; perimeters come from the finest domain with a fire grid. `fb-sfire run` prints the domains it found.
 - Wind speed on a domain without the fire grid roughness `WZ0` uses the atmospheric roughness `ZNT` in the same log profile.
 - `main.sfire_ref_time` is optional: it defaults to the run's `SIMULATION_START_DATE` (UTC). The Python API takes `None` for it too.
+- `fb-sfire run -o` (`--overwrite`) replaces an existing output and recomputes its KML perimeters, as `main.overwrite: true`; the error for an existing output says so.
 
 ### Changed
 - Write what the simulation can give and skip the rest with a `SkippedWarning`, so one config serves several simulations of a case: a perimeter before ignition, after the last output time (`XTIME`), or without a polygon; a weather station outside the atmospheric grid (instead of sampling the nearest edge cell) or without an observation time inside the simulation; a variable whose WRF-SFIRE fields or sensor height are missing; and a whole section that fails on the data. `fb-sfire run` prints each one as `WARNING:`, the count at the end, and exits 0. An unknown method still stops the run, before the output is created.
 - Keep in a station's series only the observation times the simulation covers, instead of stopping when the simulation does not cover the whole window.
 - A point is inside a domain when it is inside the boundary of its (trimmed) grid, instead of inside the latitude and longitude bounds, which hold points beyond the corners of a projected grid. This applies to weather stations and to the cells of `burn_severity_cbi`.
 - The public functions take a run (`open_run`) or one open wrfout `Dataset`.
+- Reduced outputs (variables left out by the IO config): a missing variable is named in the warning (`FUEL_FRAC is not in the output of d02`), and a variable with other dimensions than expected is skipped with them, instead of failing on the netCDF read.
+- A 3D `FMC_GC` (the 10-hour class alone) is told from a 4D one by its dimensions; `weather.i_fmc_10h: null` is no longer needed for it.
 
 ### Fixed
+- Python 3.10 and 3.11: reading a run no longer stops with `TypeError: unhashable type: 'slice'`.
 - Weather stations with `fire_grid_bound` above 0 read the grid cell nearest to them: the nearest point was found on the trimmed grid and its indices read on the full one, `fire_grid_bound` cells away (atmospheric variables and `WZ0`).
 
 ## [0.1-dev2] - 2026-10-13

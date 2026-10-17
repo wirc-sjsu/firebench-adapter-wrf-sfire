@@ -75,6 +75,8 @@ fb-sfire run adapters/wrf-sfire.yaml
 ```
 
 It writes `output/FBF-0001_WRF-SFIRE.h5` and the perimeters' KML files under `output/kml_model/`.
+An existing output stops the run; `fb-sfire run -o adapters/wrf-sfire.yaml` replaces it and
+recomputes the KML files (as `main.overwrite: true`).
 
 The `burn_severity_cbi` section writes RAVG's four-class composite burn index
 (`ravg_composite_burn_index_severity`) from the fraction of fuel left, `FUEL_FRAC`, at the end of the
@@ -94,7 +96,25 @@ run still exits 0:
 - a whole section that fails on the data (for example `FUEL_FRAC` missing for `burn_severity_cbi`).
 
 A station keeps only the observation times the simulation covers. The site then tells which periods
-and KPI groups the output can be scored on. A config error, such as an unknown method, still stops
+and KPI groups the output can be scored on.
+
+### Reduced outputs
+
+A run whose IO config (`iofields_filename`) leaves variables out of the wrfout files is read as it
+is: a missing variable skips what needs it, and the warning names it (`FUEL_FRAC is not in the output
+of d02`). To score every family, keep these variables in the output:
+
+| Section | Variables |
+|---|---|
+| every section | `XTIME`, `XLAT`, `XLONG`, `FXLAT`, `FXLONG` |
+| `perimeters` | `TIGN_G` |
+| `burn_severity_cbi`, `severity` | `FUEL_FRAC` (the last output file is enough) |
+| `building_damage` | `FIRE_AREA` |
+| `ravg_cc` | `FIRE_AREA`, `CFB` |
+| `weather` | `T2`, `Q2`, `PSFC`, `U10`, `V10`, `COSALPHA`, `SINALPHA`, `WZ0` (fire domain) or `ZNT`, `FMC_GC` |
+
+`FMC_GC` may hold every fuel class (`weather.i_fmc_10h` picks the 10-hour class, 1 by default) or the
+10-hour class alone; the adapter tells them apart by their dimensions. A config error, such as an unknown method, still stops
 the run before anything is written.
 
 ## 5. Submit

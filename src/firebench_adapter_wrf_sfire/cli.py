@@ -40,7 +40,14 @@ def main() -> None:
 
 @main.command()
 @click.argument("config_yml", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def run(config_yml: Path) -> None:
+@click.option(
+    "-o",
+    "--overwrite",
+    "overwrite_flag",
+    is_flag=True,
+    help="Replace an existing output file and recompute its KML perimeters (as main.overwrite: true).",
+)
+def run(config_yml: Path, overwrite_flag: bool) -> None:
     """Run WRF-SFIRE adapter processing from CONFIG_YML."""
     config = _load_config(config_yml)
     config_dir = config_yml.resolve().parent
@@ -54,7 +61,7 @@ def run(config_yml: Path) -> None:
     wrf_path = _required_path(main_config, "wrf_path", config_dir)
     output_path = _required_path(main_config, "output_path", config_dir)
     authors = _required_str(main_config, "authors")
-    overwrite = bool(main_config.get("overwrite", False))
+    overwrite = overwrite_flag or bool(main_config.get("overwrite", False))
     compression_lvl = int(main_config.get("compression_lvl", DEFAULT_COMPRESSION_LVL))
     fire_grid_bound = int(main_config.get("fire_grid_bound", DEFAULT_FIRE_GRID_BOUND))
 
@@ -82,7 +89,7 @@ def run(config_yml: Path) -> None:
             )
 
     if output_path.exists() and not overwrite:
-        raise click.UsageError(f"Output file already exists: {output_path}")
+        raise click.UsageError(f"Output file already exists: {output_path}; run with -o to replace it.")
     try:
         run_files = open_run(wrf_path)
     except (OSError, ValueError) as exc:
@@ -92,7 +99,9 @@ def run(config_yml: Path) -> None:
         try:
             new_h5 = fs.new_std_file(str(output_path), authors, overwrite=overwrite)
         except FileExistsError as exc:
-            raise click.UsageError(f"Output file already exists: {output_path}") from exc
+            raise click.UsageError(
+                f"Output file already exists: {output_path}; run with -o to replace it."
+            ) from exc
         caught = _run_sections(
             config,
             config_dir,

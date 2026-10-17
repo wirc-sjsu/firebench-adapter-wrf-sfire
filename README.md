@@ -54,6 +54,10 @@ fb-sfire run config.yml
 The config contains a `main` section for shared paths and times, plus dedicated sections such as
 `severity`, `building_damage`, `ravg_cc`, `perimeters`, and `weather`.
 
+To enter a benchmark case of the FireBench Foundation site (`FBF-` cases), download the case's
+benchmark kit with the WRF-SFIRE adapter chosen, then run `fb-sfire run adapters/wrf-sfire.yaml`; see
+`docs/tutorials/benchmark_kit_wrf_sfire.md`.
+
 See the tutorial in the documentation for a complete WRF-SFIRE to FireBench workflow:
 
 https://firebench-adapter-wrf-sfire.readthedocs.io/en/latest/tutorials/caldor_wrf_sfire.html

@@ -10,6 +10,7 @@ from firebench_adapter_wrf_sfire import (
     get_building_damage,
     get_mtbs_severity_surf,
     get_perimeters_from_t_ign_g,
+    get_ravg_cbi_severity,
     get_ravg_cc,
     get_weather_stations,
 )
@@ -20,6 +21,7 @@ def test_public_api_exports_documented_functions():
     assert callable(get_mtbs_severity_surf)
     assert callable(get_perimeters_from_t_ign_g)
     assert callable(get_ravg_cc)
+    assert callable(get_ravg_cbi_severity)
     assert callable(get_weather_stations)
 
     for name in (
@@ -27,6 +29,7 @@ def test_public_api_exports_documented_functions():
         "get_mtbs_severity_surf",
         "get_perimeters_from_t_ign_g",
         "get_ravg_cc",
+        "get_ravg_cbi_severity",
         "get_weather_stations",
     ):
         assert name in adapter.__all__

@@ -15,6 +15,7 @@ from firebench_adapter_wrf_sfire import (
     get_building_damage,
     get_mtbs_severity_surf,
     get_perimeters_from_t_ign_g,
+    get_ravg_cbi_severity,
     get_ravg_cc,
     get_weather_stations,
 )
@@ -22,6 +23,8 @@ from firebench_adapter_wrf_sfire import (
 DEFAULT_COMPRESSION_LVL = 3
 DEFAULT_FIRE_GRID_BOUND = 25
 DEFAULT_PERIMETER_KML_DIR = "kml_model"
+# Root attribute of a FireBench model-output template (firebench.benchmarks.fire_case_definition).
+TEMPLATE_ATTRIBUTE = "firebench_template"
 
 
 @click.group()
@@ -41,7 +44,7 @@ def run(config_yml: Path) -> None:
     if not enabled_sections:
         raise click.UsageError("At least one processing section must have enabled: true.")
 
-    obs_path = _required_path(main_config, "obs_path", config_dir)
+    obs_path = _reference_path(main_config, config_dir)
     wrf_path = _required_path(main_config, "wrf_path", config_dir)
     output_path = _required_path(main_config, "output_path", config_dir)
     authors = _required_str(main_config, "authors")
@@ -49,10 +52,10 @@ def run(config_yml: Path) -> None:
     compression_lvl = int(main_config.get("compression_lvl", DEFAULT_COMPRESSION_LVL))
     fire_grid_bound = int(main_config.get("fire_grid_bound", DEFAULT_FIRE_GRID_BOUND))
 
-    if not obs_path.is_file():
-        raise click.UsageError(f"Observation file does not exist: {obs_path}")
     if not wrf_path.is_file():
         raise click.UsageError(f"WRF-SFIRE file does not exist: {wrf_path}")
+
+    _check_case(config, obs_path)
 
     sfire_ref_time = _optional_str(main_config, "sfire_ref_time")
     start_dt = _optional_datetime(main_config, "start_dt")
@@ -78,6 +81,7 @@ def run(config_yml: Path) -> None:
             _run_severity(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
             _run_building_damage(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
             _run_ravg_cc(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
+            _run_burn_severity_cbi(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
             _run_perimeters(
                 config,
                 config_dir,
@@ -159,6 +163,63 @@ def _resolve_path(path: Path, base_dir: Path) -> Path:
     return base_dir / path
 
 
+def _reference_path(main_config: dict[str, Any], config_dir: Path) -> Path:
+    """The file the output is laid out on: an observation file or a benchmark kit's template."""
+    has_obs = main_config.get("obs_path") is not None
+    has_template = main_config.get("template_path") is not None
+    if has_obs and has_template:
+        raise click.UsageError("Give main.obs_path or main.template_path, not both.")
+    if not has_obs and not has_template:
+        raise click.UsageError(
+            "main.template_path (the template.h5 of a benchmark kit) or main.obs_path is required."
+        )
+    if has_obs:
+        obs_path = _required_path(main_config, "obs_path", config_dir)
+        if not obs_path.is_file():
+            raise click.UsageError(f"Observation file does not exist: {obs_path}")
+        return obs_path
+
+    template_path = _required_path(main_config, "template_path", config_dir)
+    if not template_path.is_file():
+        raise click.UsageError(f"Template file does not exist: {template_path}")
+    with h5py.File(template_path, "r") as template_h5:
+        if TEMPLATE_ATTRIBUTE not in template_h5.attrs:
+            raise click.UsageError(
+                f"{template_path} is not a model-output template (no root attribute "
+                f"{TEMPLATE_ATTRIBUTE}). Give an observation file as main.obs_path."
+            )
+    return template_path
+
+
+def _check_case(config: dict[str, Any], reference_path: Path) -> None:
+    """Stop when the reference holds a case definition other than the one the config names."""
+    section = _optional_mapping(config, "case")
+    expected = section.get("definition_sha256")
+    if expected is None:
+        return
+    try:
+        # Imported here so that a FireBench without generic cases still runs an obs_path config.
+        # pylint: disable-next=import-outside-toplevel
+        from firebench.benchmarks.fire_case_definition import definition_sha256, read_case_definition
+    except ImportError as exc:
+        raise click.UsageError(
+            "case.definition_sha256 needs a FireBench with generic benchmark cases (0.11 or later)."
+        ) from exc
+
+    try:
+        definition = read_case_definition(reference_path)
+    except ValueError as exc:
+        raise click.UsageError(f"{reference_path}: {exc}") from exc
+    if definition is None:
+        return
+    if definition_sha256(definition) != expected:
+        raise click.UsageError(
+            f"This config was made for another version of the case {section.get('id', '')}: "
+            f"{reference_path} holds the definition {definition_sha256(definition)}, "
+            f"the config names {expected}."
+        )
+
+
 def _optional_datetime(config: dict[str, Any], key: str) -> datetime | None:
     value = config.get(key)
     if value is None:
@@ -186,7 +247,14 @@ def _section_enabled(config: dict[str, Any], section_name: str) -> bool:
 def _enabled_processing_sections(config: dict[str, Any]) -> list[str]:
     return [
         section_name
-        for section_name in ("severity", "building_damage", "ravg_cc", "perimeters", "weather")
+        for section_name in (
+            "severity",
+            "building_damage",
+            "ravg_cc",
+            "burn_severity_cbi",
+            "perimeters",
+            "weather",
+        )
         if _section_enabled(config, section_name)
     ]
 
@@ -270,6 +338,37 @@ def _run_ravg_cc(
         method=section.get("method", "cfb"),
         fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
         compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+    )
+
+
+def _run_burn_severity_cbi(
+    config: dict[str, Any],
+    new_h5: h5py.File,
+    obs_h5: h5py.File,
+    wrf_dataset: Dataset,
+    fire_grid_bound: int,
+    compression_lvl: int,
+) -> None:
+    section = _optional_mapping(config, "burn_severity_cbi")
+    if not section.get("enabled", False):
+        return
+
+    click.echo("Process RAVG Composite Burn Index Severity")
+    kwargs = {
+        "method": section.get("method", "fuel_frac"),
+        "fire_grid_bound": int(section.get("fire_grid_bound", fire_grid_bound)),
+        "compression_lvl": int(section.get("compression_lvl", compression_lvl)),
+    }
+    cbi_thresholds = section.get("cbi_thresholds")
+    if cbi_thresholds is not None:
+        kwargs["cbi_thresholds"] = np.array(cbi_thresholds, dtype=np.float64)
+
+    get_ravg_cbi_severity(
+        new_h5,
+        obs_h5,
+        _required_str(section, "group_path"),
+        wrf_dataset,
+        **kwargs,
     )
 
 

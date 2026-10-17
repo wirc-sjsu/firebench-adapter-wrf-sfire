@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from firebench import Quantity, svn
 from bisect import bisect_left, bisect_right
 from firebench.adapter_common.interpolation import find_nearest_grid_point
+from firebench.adapter_common.weather import write_model_sensor_height_metadata
 from scipy.interpolate import interp1d
 
 from ._grid import fire_grid_slice
@@ -296,6 +297,16 @@ def __process_weather_station(
         print("No data in time period. Skip")
         return
 
+    grid_slice = fire_grid_slice(fire_grid_bound)
+    xlat = np.array(wrf_dataset["XLAT"][0, grid_slice, grid_slice])
+    xlon = np.array(wrf_dataset["XLONG"][0, grid_slice, grid_slice])
+    station_lat = obs_h5[station_path].attrs["position_lat"]
+    station_lon = obs_h5[station_path].attrs["position_lon"]
+    if not (xlat.min() <= station_lat <= xlat.max() and xlon.min() <= station_lon <= xlon.max()):
+        # The nearest grid point would be on the edge of the domain, far from the station.
+        print("Station outside the model domain. Skip")
+        return
+
     # SFIRE time
     _validate_matching_timezone(sfire_ref_time, period_start_dt, period_end_dt)
     sfire_ref_time = _as_utc_datetime(sfire_ref_time)
@@ -315,9 +326,6 @@ def __process_weather_station(
     _write_time_dataset_seconds(new_wx, time_in_period, time_origin, compression_lvl)
 
     # get SFIRE data
-    grid_slice = fire_grid_slice(fire_grid_bound)
-    xlat = np.array(wrf_dataset["XLAT"][0, grid_slice, grid_slice])
-    xlon = np.array(wrf_dataset["XLONG"][0, grid_slice, grid_slice])
     Ny, Nx = xlat.shape
     min_dlat = np.min(np.diff(xlat, axis=0))
     min_dlon = np.min(np.diff(xlon, axis=1))
@@ -362,6 +370,7 @@ def __process_weather_station(
                 svn.AIR_TEMPERATURE.value, data=sfire_t2_interp, **hdf5plugin.Zstd(clevel=compression_lvl)
             )
             var.attrs["units"] = "degK"
+            write_model_sensor_height_metadata(var, Quantity(2.0, "m"))
         else:
             print("No method for other height than 2m")
 
@@ -403,6 +412,7 @@ def __process_weather_station(
                 **hdf5plugin.Zstd(clevel=compression_lvl),
             )
             var.attrs["units"] = "percent"
+            write_model_sensor_height_metadata(var, Quantity(2.0, "m"))
         else:
             print("No method for other height than 2m")
 
@@ -410,12 +420,15 @@ def __process_weather_station(
     if svn.WIND_DIRECTION.value in station.keys():
         print("Process wind direction")
         # Verify WD10
-        if _sensor_height_check_ok(
-            sensor_height=fs.read_quantity_from_fb_attribute(
+        wd_sensor_height = (
+            fs.read_quantity_from_fb_attribute(
                 f"{station_path}/{svn.WIND_DIRECTION.value}", "sensor_height", obs_h5, dtype=float
             )
             .to("m")
-            .magnitude,
+            .magnitude
+        )
+        if _sensor_height_check_ok(
+            sensor_height=wd_sensor_height,
             min_height_ok=0,
             max_height_ok=20,
         ):
@@ -452,6 +465,9 @@ def __process_weather_station(
                 **hdf5plugin.Zstd(clevel=compression_lvl),
             )
             var.attrs["units"] = "degree"
+            # The log profile that scales the wind speed keeps its direction: the 10 m direction
+            # is the direction at the sensor height.
+            write_model_sensor_height_metadata(var, Quantity(wd_sensor_height, "m"))
         else:
             print("No method for other height than 10m")
 
@@ -509,6 +525,7 @@ def __process_weather_station(
             time_in_period_sfire,
         )
         var.attrs["units"] = "m/s"
+        write_model_sensor_height_metadata(var, Quantity(sensor_height, "m"))
         var = new_wx.create_dataset(
             "WS10",
             data=sfire_data_interp_10,

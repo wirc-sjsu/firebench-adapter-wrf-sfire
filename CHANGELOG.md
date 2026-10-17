@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Read a FireBench Foundation benchmark kit: `main.template_path` names the kit's model-output template (root attribute `firebench_template`) in place of `main.obs_path`. Giving both is refused.
+- Check the optional `case.definition_sha256` against the case definition the template holds, and stop when the config was made for another version of the case.
+- Add the `burn_severity_cbi` section and `get_ravg_cbi_severity`: RAVG four-class composite burn index (`ravg_composite_burn_index_severity`) from `FUEL_FRAC`, on the reference grid, with the reference's dtype, `units`, and `_FillValue`; cells outside the fire grid take the `_FillValue`.
+- Record the sensor height each weather variable was prepared at (`sensor_height`, `sensor_height_units`): 2 m for air temperature and relative humidity, the station's height for wind speed and wind direction.
+- Add the tutorial "Enter a FireBench Foundation benchmark case".
+
+### Changed
+- Skip a weather station outside the atmospheric grid instead of sampling the nearest edge cell.
+
 ## [0.1-dev2] - 2026-10-13
 
 ### Added

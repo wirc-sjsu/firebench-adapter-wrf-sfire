@@ -6,6 +6,9 @@ The CLI uses one YAML config file to describe the inputs, output path, shared ru
 
 ## Inputs and Output
 
+Caldor gives its observation file, so its config names it as `main.obs_path`. A benchmark case of the
+FireBench Foundation site gives a kit instead; see "Enter A FireBench Foundation Benchmark Case".
+
 The workflow uses two inputs:
 
 - a FireBench observation/reference file, for example `/path/to/firebench-data/Caldor.h5`
@@ -81,6 +84,7 @@ Each processing section has an `enabled` flag:
 - `severity`: converts WRF-SFIRE `FUEL_FRAC` into an MTBS-style burn severity surface.
 - `building_damage`: samples WRF-SFIRE `FIRE_AREA` at building locations.
 - `ravg_cc`: converts `FIRE_AREA` and `CFB` into a RAVG canopy-cover-loss surface.
+- `burn_severity_cbi`: converts `FUEL_FRAC` into RAVG's four-class composite burn index.
 - `perimeters`: extracts fire perimeters from `TIGN_G` and stores KML metadata.
 - `weather`: samples and standardizes weather-station variables.
 

@@ -34,6 +34,13 @@ MTBS Severity
    :members:
    :undoc-members:
 
+RAVG CBI Severity
+-----------------
+
+.. automodule:: firebench_adapter_wrf_sfire.severity_cbi
+   :members:
+   :undoc-members:
+
 Weather Stations
 ----------------
 

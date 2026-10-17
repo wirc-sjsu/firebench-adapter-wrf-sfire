@@ -11,6 +11,7 @@ from firebench.adapter_common.weather import write_model_sensor_height_metadata
 from scipy.interpolate import interp1d
 
 from ._grid import fire_grid_slice
+from ._skip import skip
 
 GRAVITY = 9.81
 
@@ -272,6 +273,11 @@ def wind_from10m_with_roughness(s10, z, z0, z0_min=1e-4):
     return np.maximum(u, 0.0)
 
 
+# Errors that mean the simulation or the reference cannot give a variable or a station: a missing
+# netCDF variable (IndexError), a missing attribute or dataset (KeyError), a value out of range.
+SKIPPABLE_ERRORS = (KeyError, IndexError, ValueError)
+
+
 def __process_weather_station(
     new_h5: h5py.File,
     obs_h5: h5py.File,
@@ -304,7 +310,7 @@ def __process_weather_station(
     station_lon = obs_h5[station_path].attrs["position_lon"]
     if not (xlat.min() <= station_lat <= xlat.max() and xlon.min() <= station_lon <= xlon.max()):
         # The nearest grid point would be on the edge of the domain, far from the station.
-        print("Station outside the model domain. Skip")
+        skip(station_path, "outside the model domain")
         return
 
     # SFIRE time
@@ -316,10 +322,22 @@ def __process_weather_station(
     offset_station_to_period_start = (time_origin - period_start_dt).total_seconds()
     time_in_period_sfire = time_in_period + offset_station_to_period_start
     time_sfire = _sfire_time_seconds(wrf_dataset, offset_start)
+
+    # Keep the observation times the simulation covers: the periods inside them can be scored.
+    covered = _mask_between_inclusive(time_in_period_sfire, time_sfire[0], time_sfire[-1])
+    if not covered.any():
+        skip(station_path, "no observation time inside the simulation")
+        return
+    if not covered.all():
+        print(f"Simulation covers {covered.sum()} of {covered.size} observation times")
+    time_in_period = time_in_period[covered]
+    time_in_period_sfire = time_in_period_sfire[covered]
     i_start, i_end = _bracket_indices_inclusive(
         time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1]
     )
     _validate_bracket(i_start, i_end, time_sfire, time_in_period_sfire[0], time_in_period_sfire[-1])
+    model_time = time_sfire[i_start : i_end + 1]
+    model_slice = slice(i_start, i_end + 1)
 
     # Add time to new group
     new_wx = _create_station_group_with_attrs(new_h5, obs_h5, station_path, STATION_ATTRS_TO_COPY)
@@ -329,238 +347,113 @@ def __process_weather_station(
     Ny, Nx = xlat.shape
     min_dlat = np.min(np.diff(xlat, axis=0))
     min_dlon = np.min(np.diff(xlon, axis=1))
+    i_nearest, j_nearest = find_nearest_grid_point(
+        Nx, Ny, station_lat, station_lon, xlat, xlon, min_dlat, min_dlon
+    )
 
-    fxlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
-    fxlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
-    Nyf, Nxf = fxlat.shape
-    min_dlatf = np.min(np.diff(fxlat, axis=0))
-    min_dlonf = np.min(np.diff(fxlon, axis=1))
+    def obs_sensor_height(variable: str) -> float:
+        return (
+            fs.read_quantity_from_fb_attribute(
+                f"{station_path}/{variable}", "sensor_height", obs_h5, dtype=float
+            )
+            .to("m")
+            .magnitude
+        )
 
-    station = obs_h5[station_path]
-    # Air temperature
-    if svn.AIR_TEMPERATURE.value in station.keys():
-        print("Process air temperature")
+    def write(variable: str, raw: np.ndarray, units: str, prepared_height_m: float | None):
+        var = new_wx.create_dataset(
+            variable,
+            data=_interp_linear_1d_strict(model_time, raw, time_in_period_sfire),
+            **hdf5plugin.Zstd(clevel=compression_lvl),
+        )
+        var.attrs["units"] = units
+        if prepared_height_m is not None:
+            write_model_sensor_height_metadata(var, Quantity(prepared_height_m, "m"))
+
+    def air_temperature():
         # Use T2 within interval 0m to 4m
-        if _sensor_height_check_ok(
-            sensor_height=fs.read_quantity_from_fb_attribute(
-                f"{station_path}/{svn.AIR_TEMPERATURE.value}", "sensor_height", obs_h5, dtype=float
-            )
-            .to("m")
-            .magnitude,
-            min_height_ok=0,
-            max_height_ok=4,
-        ):
-            print("Nearest T2")
-            i_nearest, j_nearest = find_nearest_grid_point(
-                Nx,
-                Ny,
-                obs_h5[station_path].attrs["position_lat"],
-                obs_h5[station_path].attrs["position_lon"],
-                xlat,
-                xlon,
-                min_dlat,
-                min_dlon,
-            )
-            sfire_t2_interp = _interp_linear_1d_strict(
-                time_sfire[i_start : i_end + 1],
-                wrf_dataset["T2"][i_start : i_end + 1, j_nearest, i_nearest],
-                time_in_period_sfire,
-            )
-            var = new_wx.create_dataset(
-                svn.AIR_TEMPERATURE.value, data=sfire_t2_interp, **hdf5plugin.Zstd(clevel=compression_lvl)
-            )
-            var.attrs["units"] = "degK"
-            write_model_sensor_height_metadata(var, Quantity(2.0, "m"))
-        else:
-            print("No method for other height than 2m")
+        if not _sensor_height_check_ok(obs_sensor_height(svn.AIR_TEMPERATURE.value), 0, 4):
+            raise ValueError("no method for a sensor height outside 0 m to 4 m")
+        print("Nearest T2")
+        write(svn.AIR_TEMPERATURE.value, wrf_dataset["T2"][model_slice, j_nearest, i_nearest], "degK", 2.0)
 
-    # Relative Humidity
-    if svn.RELATIVE_HUMIDITY.value in station.keys():
-        print("Process RH2")
-        # Verify RH2
-        if _sensor_height_check_ok(
-            sensor_height=fs.read_quantity_from_fb_attribute(
-                f"{station_path}/{svn.RELATIVE_HUMIDITY.value}", "sensor_height", obs_h5, dtype=float
-            )
-            .to("m")
-            .magnitude,
-            min_height_ok=0,
-            max_height_ok=4,
-        ):
-            print("Nearest RH2")
-            i_nearest, j_nearest = find_nearest_grid_point(
-                Nx,
-                Ny,
-                obs_h5[station_path].attrs["position_lat"],
-                obs_h5[station_path].attrs["position_lon"],
-                xlat,
-                xlon,
-                min_dlat,
-                min_dlon,
-            )
-            t2_raw = wrf_dataset["T2"][i_start : i_end + 1, j_nearest, i_nearest]
-            q2_raw = wrf_dataset["Q2"][i_start : i_end + 1, j_nearest, i_nearest]
-            psfc_raw = wrf_dataset["PSFC"][i_start : i_end + 1, j_nearest, i_nearest]
-            sfire_data_interp = _interp_linear_1d_strict(
-                time_sfire[i_start : i_end + 1],
-                _rh_from_wrf_q2_t2_psfc(q2_raw, t2_raw, psfc_raw),
-                time_in_period_sfire,
-            )
-            var = new_wx.create_dataset(
-                svn.RELATIVE_HUMIDITY.value,
-                data=sfire_data_interp,
-                **hdf5plugin.Zstd(clevel=compression_lvl),
-            )
-            var.attrs["units"] = "percent"
-            write_model_sensor_height_metadata(var, Quantity(2.0, "m"))
-        else:
-            print("No method for other height than 2m")
+    def relative_humidity():
+        if not _sensor_height_check_ok(obs_sensor_height(svn.RELATIVE_HUMIDITY.value), 0, 4):
+            raise ValueError("no method for a sensor height outside 0 m to 4 m")
+        print("Nearest RH2")
+        t2_raw = wrf_dataset["T2"][model_slice, j_nearest, i_nearest]
+        q2_raw = wrf_dataset["Q2"][model_slice, j_nearest, i_nearest]
+        psfc_raw = wrf_dataset["PSFC"][model_slice, j_nearest, i_nearest]
+        write(
+            svn.RELATIVE_HUMIDITY.value, _rh_from_wrf_q2_t2_psfc(q2_raw, t2_raw, psfc_raw), "percent", 2.0
+        )
 
-    # Wind direction
-    if svn.WIND_DIRECTION.value in station.keys():
-        print("Process wind direction")
-        # Verify WD10
-        wd_sensor_height = (
-            fs.read_quantity_from_fb_attribute(
-                f"{station_path}/{svn.WIND_DIRECTION.value}", "sensor_height", obs_h5, dtype=float
-            )
-            .to("m")
-            .magnitude
-        )
-        if _sensor_height_check_ok(
-            sensor_height=wd_sensor_height,
-            min_height_ok=0,
-            max_height_ok=20,
-        ):
-            print("Nearest WD10 used for WD measured between 0m and 20m")
-            i_nearest, j_nearest = find_nearest_grid_point(
-                Nx,
-                Ny,
-                obs_h5[station_path].attrs["position_lat"],
-                obs_h5[station_path].attrs["position_lon"],
-                xlat,
-                xlon,
-                min_dlat,
-                min_dlon,
-            )
-            u10_raw = wrf_dataset["U10"][i_start : i_end + 1, j_nearest, i_nearest]
-            v10_raw = wrf_dataset["V10"][i_start : i_end + 1, j_nearest, i_nearest]
-            cosalpha_raw, sinalpha_raw = _get_wind_rotation(
-                wrf_dataset,
-                slice(i_start, i_end + 1),
-                j_nearest,
-                i_nearest,
-            )
-            u_true = u10_raw * cosalpha_raw - v10_raw * sinalpha_raw
-            v_true = u10_raw * sinalpha_raw + v10_raw * cosalpha_raw
-            wind_dir_raw = wind_dir_from_uv(u_true, v_true)
-            sfire_data_interp = _interp_linear_1d_strict(
-                time_sfire[i_start : i_end + 1],
-                wind_dir_raw,
-                time_in_period_sfire,
-            )
-            var = new_wx.create_dataset(
-                svn.WIND_DIRECTION.value,
-                data=sfire_data_interp,
-                **hdf5plugin.Zstd(clevel=compression_lvl),
-            )
-            var.attrs["units"] = "degree"
-            # The log profile that scales the wind speed keeps its direction: the 10 m direction
-            # is the direction at the sensor height.
-            write_model_sensor_height_metadata(var, Quantity(wd_sensor_height, "m"))
-        else:
-            print("No method for other height than 10m")
+    def wind_direction():
+        wd_sensor_height = obs_sensor_height(svn.WIND_DIRECTION.value)
+        if not _sensor_height_check_ok(wd_sensor_height, 0, 20):
+            raise ValueError("no method for a sensor height outside 0 m to 20 m")
+        print("Nearest WD10 used for WD measured between 0m and 20m")
+        u10_raw = wrf_dataset["U10"][model_slice, j_nearest, i_nearest]
+        v10_raw = wrf_dataset["V10"][model_slice, j_nearest, i_nearest]
+        cosalpha_raw, sinalpha_raw = _get_wind_rotation(wrf_dataset, model_slice, j_nearest, i_nearest)
+        u_true = u10_raw * cosalpha_raw - v10_raw * sinalpha_raw
+        v_true = u10_raw * sinalpha_raw + v10_raw * cosalpha_raw
+        # The log profile that scales the wind speed keeps its direction: the 10 m direction
+        # is the direction at the sensor height.
+        write(svn.WIND_DIRECTION.value, wind_dir_from_uv(u_true, v_true), "degree", wd_sensor_height)
 
-    # Wind speed
-    if svn.WIND_SPEED.value in station.keys():
-        print("Process wind speed")
-        sensor_height = (
-            fs.read_quantity_from_fb_attribute(
-                f"{station_path}/{svn.WIND_SPEED.value}", "sensor_height", obs_h5, dtype=float
-            )
-            .to("m")
-            .magnitude
-        )
-        i_nearest, j_nearest = find_nearest_grid_point(
-            Nx,
-            Ny,
-            obs_h5[station_path].attrs["position_lat"],
-            obs_h5[station_path].attrs["position_lon"],
-            xlat,
-            xlon,
-            min_dlat,
-            min_dlon,
-        )
+    def wind_speed_at_sensor():
+        sensor_height = obs_sensor_height(svn.WIND_SPEED.value)
+        fxlat = np.array(wrf_dataset["FXLAT"][0, grid_slice, grid_slice])
+        fxlon = np.array(wrf_dataset["FXLONG"][0, grid_slice, grid_slice])
+        Nyf, Nxf = fxlat.shape
         if_nearest, jf_nearest = find_nearest_grid_point(
             Nxf,
             Nyf,
-            obs_h5[station_path].attrs["position_lat"],
-            obs_h5[station_path].attrs["position_lon"],
+            station_lat,
+            station_lon,
             fxlat,
             fxlon,
-            min_dlatf,
-            min_dlonf,
+            np.min(np.diff(fxlat, axis=0)),
+            np.min(np.diff(fxlon, axis=1)),
         )
         print("Nearest WS10 with S10 scaling")
-        u10_raw = wrf_dataset["U10"][i_start : i_end + 1, j_nearest, i_nearest]
-        v10_raw = wrf_dataset["V10"][i_start : i_end + 1, j_nearest, i_nearest]
+        u10_raw = wrf_dataset["U10"][model_slice, j_nearest, i_nearest]
+        v10_raw = wrf_dataset["V10"][model_slice, j_nearest, i_nearest]
         s10 = wind_speed(u10_raw, v10_raw)
-        z0 = wrf_dataset["WZ0"][i_start : i_end + 1, jf_nearest, if_nearest]
-        ws = wind_from10m_with_roughness(s10, sensor_height, z0)
-
-        sfire_data_interp = _interp_linear_1d_strict(
-            time_sfire[i_start : i_end + 1],
-            ws,
-            time_in_period_sfire,
-        )
-        var = new_wx.create_dataset(
-            svn.WIND_SPEED.value,
-            data=sfire_data_interp,
-            **hdf5plugin.Zstd(clevel=compression_lvl),
+        z0 = wrf_dataset["WZ0"][model_slice, jf_nearest, if_nearest]
+        write(
+            svn.WIND_SPEED.value, wind_from10m_with_roughness(s10, sensor_height, z0), "m/s", sensor_height
         )
         # For debug
-        sfire_data_interp_10 = _interp_linear_1d_strict(
-            time_sfire[i_start : i_end + 1],
-            s10,
-            time_in_period_sfire,
-        )
-        var.attrs["units"] = "m/s"
-        write_model_sensor_height_metadata(var, Quantity(sensor_height, "m"))
-        var = new_wx.create_dataset(
-            "WS10",
-            data=sfire_data_interp_10,
-            **hdf5plugin.Zstd(clevel=compression_lvl),
-        )
-        var.attrs["units"] = "m/s"
+        write("WS10", s10, "m/s", None)
 
-    # Fuel Moisture 10h
-    if svn.FUEL_MOISTURE_CONTENT_10H.value in station.keys():
-        print("Process fmc 10h")
-        i_nearest, j_nearest = find_nearest_grid_point(
-            Nx,
-            Ny,
-            obs_h5[station_path].attrs["position_lat"],
-            obs_h5[station_path].attrs["position_lon"],
-            xlat,
-            xlon,
-            min_dlat,
-            min_dlon,
-        )
+    def fmc_10h():
         if i_fmc_10h is None:
-            fmc10h_raw = wrf_dataset["FMC_GC"][i_start : i_end + 1, j_nearest, i_nearest]
+            fmc10h_raw = wrf_dataset["FMC_GC"][model_slice, j_nearest, i_nearest]
         else:
-            fmc10h_raw = wrf_dataset["FMC_GC"][i_start : i_end + 1, i_fmc_10h, j_nearest, i_nearest]
-        sfire_fmc10h_interp = _interp_linear_1d_strict(
-            time_sfire[i_start : i_end + 1],
-            fmc10h_raw,
-            time_in_period_sfire,
-        )
-        var = new_wx.create_dataset(
-            svn.FUEL_MOISTURE_CONTENT_10H.value,
-            data=sfire_fmc10h_interp,
-            **hdf5plugin.Zstd(clevel=compression_lvl),
-        )
-        var.attrs["units"] = "dimensionless"
+            fmc10h_raw = wrf_dataset["FMC_GC"][model_slice, i_fmc_10h, j_nearest, i_nearest]
+        write(svn.FUEL_MOISTURE_CONTENT_10H.value, fmc10h_raw, "dimensionless", None)
+
+    station = obs_h5[station_path]
+    written = 0
+    for variable, process in (
+        (svn.AIR_TEMPERATURE.value, air_temperature),
+        (svn.RELATIVE_HUMIDITY.value, relative_humidity),
+        (svn.WIND_DIRECTION.value, wind_direction),
+        (svn.WIND_SPEED.value, wind_speed_at_sensor),
+        (svn.FUEL_MOISTURE_CONTENT_10H.value, fmc_10h),
+    ):
+        if variable not in station.keys():
+            continue
+        print(f"Process {variable}")
+        try:
+            process()
+            written += 1
+        except SKIPPABLE_ERRORS as exc:
+            skip(f"{station_path}/{variable}", exc)
+    if not written:
+        del new_h5[station_path]
 
 
 def get_weather_stations(
@@ -579,20 +472,29 @@ def get_weather_stations(
     ``i_fmc_10h`` is the zero-based fuel-layer index for 10-hour fuel moisture
     in a 4D ``FMC_GC`` field (time, fuel layer, y, x), defaulting to 1. Set it
     to ``None`` for a 3D field (time, y, x) containing only 10-hour fuel moisture.
+
+    A station or a variable the simulation cannot give is left out with a ``SkippedWarning``, and
+    a station keeps only the observation times the simulation covers.
     """
     origin = _datetime_fromisoformat_utc(sfire_ref_time)
     for ts in obs_h5[f"{fs.TIME_SERIES}"].keys():
         if ts.startswith("station_"):
             print(f"Process {ts}")
-            __process_weather_station(
-                new_h5,
-                obs_h5,
-                wrf_dataset,
-                f"{fs.TIME_SERIES}/{ts}",
-                origin,
-                period_start_dt,
-                period_end_dt,
-                fire_grid_bound,
-                compression_lvl,
-                i_fmc_10h,
-            )
+            station_path = f"{fs.TIME_SERIES}/{ts}"
+            try:
+                __process_weather_station(
+                    new_h5,
+                    obs_h5,
+                    wrf_dataset,
+                    station_path,
+                    origin,
+                    period_start_dt,
+                    period_end_dt,
+                    fire_grid_bound,
+                    compression_lvl,
+                    i_fmc_10h,
+                )
+            except SKIPPABLE_ERRORS as exc:
+                if station_path in new_h5:
+                    del new_h5[station_path]
+                skip(station_path, exc)

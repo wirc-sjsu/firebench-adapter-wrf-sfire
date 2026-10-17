@@ -1,5 +1,7 @@
 from importlib.metadata import version, PackageNotFoundError
 
+from ._skip import SkippedWarning
+
 from .building_damage import get_building_damage
 from .perimeters import get_perimeters_from_t_ign_g
 from .ravg import get_ravg_cc
@@ -14,6 +16,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "__version__",
+    "SkippedWarning",
     "get_building_damage",
     "get_perimeters_from_t_ign_g",
     "get_ravg_cc",

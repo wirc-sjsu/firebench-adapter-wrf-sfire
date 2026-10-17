@@ -12,6 +12,8 @@ from os.path import getsize, relpath
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import Polygon
 
+from ._skip import skip
+
 PERIMETER_EXTRACTION_METHOD_TIGN_G = "tign_g"
 PERIMETER_EXTRACTION_METHOD_BURNED_MASK = "burned_mask"
 PERIMETER_EXTRACTION_METHODS = (
@@ -231,49 +233,94 @@ def get_perimeters_from_t_ign_g(
         raise ValueError("TIGN_G contains no finite values in the selected fire grid.")
     min_t_ign_g = float(np.min(valid_t_ign_g))
     max_t_ign_g = float(np.max(valid_t_ign_g))
+    # TIGN_G is read at the last output time, the horizon of the simulation (XTIME, in minutes).
+    horizon_s = float(wrf_dataset["XTIME"][-1]) * 60 if "XTIME" in wrf_dataset.variables else None
 
     for perim_path in list_perimeter_paths:
-        obs_datetime_raw = datetime.fromisoformat(obs_h5[perim_path].attrs["time"].replace("Z", "+00:00"))
-        obs_datetime = _as_utc_datetime(obs_datetime_raw)
-        _validate_matching_timezone(origin_raw, obs_datetime_raw)
-        time_s = (obs_datetime - origin).total_seconds()
-        print(
-            f"Perimeter {perim_path} after {time_s} s "
-            f"(TIGN_G finite range: {min_t_ign_g} to {max_t_ign_g} s, "
-            f"method={extraction_method}, smooth_sigma={smooth_sigma})"
-        )
-        sfire_kml_path = Path(
-            f"{kml_dir}",
-            f"SFIRE_{fs.sanitize_iso8601(fs.datetime_to_iso8601(obs_datetime_raw))}.kml",
-        )
-        sfire_kml_filename = sfire_kml_path.resolve()
-        if not sfire_kml_filename.exists() or overwrite:
-            if time_s < min_t_ign_g or time_s > max_t_ign_g:
-                raise ValueError(
-                    f"Perimeter time {time_s} s for {perim_path} is outside the finite TIGN_G range "
-                    f"[{min_t_ign_g}, {max_t_ign_g}] s. Check t_ign_g_ref_time and timezone synchronization."
-                )
-            perim_sfire = _extract_perimeter_geopolygons(
-                t_ign_g, xlon, xlat, time_s, extraction_method, smooth_sigma
+        try:
+            _write_perimeter(
+                new_h5,
+                obs_h5,
+                perim_path,
+                t_ign_g,
+                xlon,
+                xlat,
+                origin,
+                origin_raw,
+                (min_t_ign_g, max_t_ign_g),
+                horizon_s,
+                kml_dir,
+                overwrite,
+                extraction_method,
+                smooth_sigma,
             )
-            if perim_sfire.empty:
-                extraction_summary = _perimeter_extraction_summary(t_ign_g, xlon, xlat, time_s)
-                raise ValueError(
-                    f"No polygon extracted for {perim_path} at {time_s} s. "
-                    f"method={extraction_method}, smooth_sigma={smooth_sigma}. "
-                    f"{extraction_summary}. "
-                    "Check t_ign_g_ref_time, timezone synchronization, fire_grid_bound, and TIGN_G units."
-                )
-            perim_sfire.to_file(sfire_kml_filename, driver="KML", layer="fire_perimeter")
-        else:
-            print(
-                "KML file already found in directory and reused. Use overwrite = True to recompute perimeter."
-            )
-            _validate_kml_has_polygons(sfire_kml_filename)
+        except (KeyError, ValueError) as exc:
+            skip(perim_path, exc)
 
-        grp = new_h5.create_group(perim_path)
-        grp.attrs["time"] = fs.datetime_to_iso8601(obs_datetime_raw)
-        h5_parent = Path(new_h5.filename).resolve().parent
-        grp.attrs["rel_path"] = Path(relpath(sfire_kml_filename, start=h5_parent)).as_posix()
-        grp.attrs["sha256"] = ft.calculate_sha256(sfire_kml_filename)
-        grp.attrs["file_size_bytes"] = getsize(sfire_kml_filename)
+
+def _write_perimeter(  # pylint: disable=too-many-arguments,too-many-locals
+    new_h5: h5py.File,
+    obs_h5: h5py.File,
+    perim_path: str,
+    t_ign_g: np.ndarray,
+    xlon: np.ndarray,
+    xlat: np.ndarray,
+    origin: datetime,
+    origin_raw: datetime,
+    t_ign_g_range: tuple[float, float],
+    horizon_s: float | None,
+    kml_dir: str,
+    overwrite: bool,
+    extraction_method: str,
+    smooth_sigma: float,
+):
+    min_t_ign_g, max_t_ign_g = t_ign_g_range
+    obs_datetime_raw = datetime.fromisoformat(obs_h5[perim_path].attrs["time"].replace("Z", "+00:00"))
+    obs_datetime = _as_utc_datetime(obs_datetime_raw)
+    _validate_matching_timezone(origin_raw, obs_datetime_raw)
+    time_s = (obs_datetime - origin).total_seconds()
+    if horizon_s is not None and time_s > horizon_s:
+        raise ValueError(
+            f"its time {time_s} s is after the end of the simulation ({horizon_s} s after "
+            "t_ign_g_ref_time)."
+        )
+    print(
+        f"Perimeter {perim_path} after {time_s} s "
+        f"(TIGN_G finite range: {min_t_ign_g} to {max_t_ign_g} s, "
+        f"method={extraction_method}, smooth_sigma={smooth_sigma})"
+    )
+    sfire_kml_path = Path(
+        f"{kml_dir}",
+        f"SFIRE_{fs.sanitize_iso8601(fs.datetime_to_iso8601(obs_datetime_raw))}.kml",
+    )
+    sfire_kml_filename = sfire_kml_path.resolve()
+    if not sfire_kml_filename.exists() or overwrite:
+        if time_s < min_t_ign_g or time_s > max_t_ign_g:
+            raise ValueError(
+                f"Perimeter time {time_s} s for {perim_path} is outside the finite TIGN_G range "
+                f"[{min_t_ign_g}, {max_t_ign_g}] s. Check t_ign_g_ref_time and timezone synchronization."
+            )
+        perim_sfire = _extract_perimeter_geopolygons(
+            t_ign_g, xlon, xlat, time_s, extraction_method, smooth_sigma
+        )
+        if perim_sfire.empty:
+            extraction_summary = _perimeter_extraction_summary(t_ign_g, xlon, xlat, time_s)
+            raise ValueError(
+                f"No polygon extracted for {perim_path} at {time_s} s. "
+                f"method={extraction_method}, smooth_sigma={smooth_sigma}. "
+                f"{extraction_summary}. "
+                "Check t_ign_g_ref_time, timezone synchronization, fire_grid_bound, and TIGN_G units."
+            )
+        perim_sfire.to_file(sfire_kml_filename, driver="KML", layer="fire_perimeter")
+    else:
+        print(
+            "KML file already found in directory and reused. Use overwrite = True to recompute perimeter."
+        )
+        _validate_kml_has_polygons(sfire_kml_filename)
+
+    grp = new_h5.create_group(perim_path)
+    grp.attrs["time"] = fs.datetime_to_iso8601(obs_datetime_raw)
+    h5_parent = Path(new_h5.filename).resolve().parent
+    grp.attrs["rel_path"] = Path(relpath(sfire_kml_filename, start=h5_parent)).as_posix()
+    grp.attrs["sha256"] = ft.calculate_sha256(sfire_kml_filename)
+    grp.attrs["file_size_bytes"] = getsize(sfire_kml_filename)

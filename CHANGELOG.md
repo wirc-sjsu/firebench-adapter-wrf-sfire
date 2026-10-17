@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Add the tutorial "Enter a FireBench Foundation benchmark case".
 
 ### Changed
-- Skip a weather station outside the atmospheric grid instead of sampling the nearest edge cell.
+- Write what the simulation can give and skip the rest with a `SkippedWarning`, so one config serves several simulations of a case: a perimeter before ignition, after the last output time (`XTIME`), or without a polygon; a weather station outside the atmospheric grid (instead of sampling the nearest edge cell) or without an observation time inside the simulation; a variable whose WRF-SFIRE fields or sensor height are missing; and a whole section that fails on the data. `fb-sfire run` prints each one as `WARNING:`, the count at the end, and exits 0. An unknown method still stops the run, before the output is created.
+- Keep in a station's series only the observation times the simulation covers, instead of stopping when the simulation does not cover the whole window.
 
 ## [0.1-dev2] - 2026-10-13
 

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -10,6 +11,7 @@ from firebench.benchmarks.fire_case_definition import definition_sha256, write_c
 from firebench.standardize import TIME_SERIES
 from netCDF4 import Dataset
 
+import firebench_adapter_wrf_sfire.perimeters as perimeters_module
 from firebench_adapter_wrf_sfire.cli import main
 
 CBI_GROUP = "/spatial_2d/ravg_cbi"
@@ -175,4 +177,121 @@ def test_cli_refuses_another_version_of_the_case(kit):
 
     assert result.exit_code != 0
     assert "made for another version of the case FBF-0000" in result.output
+    assert not (kit / "adapters" / "output" / "model.h5").exists()
+
+
+def _add_station(path, name, times, variables, lat=39.0):
+    with h5py.File(path, "a") as h5:
+        station = h5.create_group(f"{TIME_SERIES}/{name}")
+        station.attrs["position_lat"] = lat
+        station.attrs["position_lon"] = -121.0
+        time = station.create_dataset("time", data=np.array(times, dtype=float))
+        time.attrs["time_origin"] = ORIGIN.isoformat()
+        time.attrs["time_units"] = "s"
+        for variable in variables:
+            dataset = station.create_dataset(variable, data=np.full(len(times), np.nan))
+            dataset.attrs["sensor_height"] = 2.0
+            dataset.attrs["sensor_height_units"] = "m"
+
+
+def test_weather_keeps_what_the_simulation_gives(kit):
+    template = kit / "adapters" / "template.h5"
+    _add_station(
+        template,
+        "station_late",
+        [0.0, 60.0, 120.0, 180.0, 240.0],
+        (svn.AIR_TEMPERATURE.value, svn.WIND_SPEED.value),
+    )
+    _add_station(template, "station_after", [600.0, 660.0], (svn.AIR_TEMPERATURE.value,))
+    end_dt = (ORIGIN + timedelta(seconds=700)).isoformat()
+    config_path = _config(
+        kit, main_extra={"template_path": "template.h5", "end_dt": end_dt}, weather={"enabled": True}
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING: time_series/station_late/wind_speed skipped" in result.output
+    assert (
+        "WARNING: time_series/station_after skipped: no observation time inside the simulation"
+        in result.output
+    )
+    assert "WARNING: time_series/station_out skipped: outside the model domain" in result.output
+    assert "3 item(s) skipped" in result.output
+    with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
+        late = out_h5[f"{TIME_SERIES}/station_late"]
+        # The simulation ends at 120 s: the later observation times are left out.
+        np.testing.assert_array_equal(late["time"][:], [0.0, 60.0, 120.0])
+        np.testing.assert_allclose(late[svn.AIR_TEMPERATURE.value][:], [290.0, 291.0, 292.0])
+        assert svn.WIND_SPEED.value not in late
+        assert f"{TIME_SERIES}/station_after" not in out_h5
+
+
+def test_perimeters_outside_the_simulation_are_skipped(kit, monkeypatch):
+    with Dataset(kit / "adapters" / "wrfout.nc", "a") as wrf:
+        tign = wrf.createVariable("TIGN_G", "f8", ("Time", "south_north", "west_east"))
+        tign[:] = np.broadcast_to(np.linspace(0.0, 300.0, 16).reshape(4, 4), (2, 4, 4))
+    paths = {"early": -60, "mid": 60, "late": 600}
+    with h5py.File(kit / "adapters" / "template.h5", "a") as h5:
+        for name, seconds in paths.items():
+            group = h5.create_group(f"/polygons/perimeter_{name}")
+            group.attrs["time"] = (ORIGIN + timedelta(seconds=seconds)).isoformat()
+
+    class FakePerimeters:
+        empty = False
+
+        @staticmethod
+        def to_file(filename, **_kwargs):
+            Path(filename).write_text("synthetic KML", encoding="utf-8")
+
+    monkeypatch.setattr(
+        perimeters_module, "_extract_perimeter_geopolygons", lambda *_a, **_k: FakePerimeters()
+    )
+    config_path = _config(
+        kit,
+        perimeters={
+            "enabled": True,
+            "paths": [f"/polygons/perimeter_{name}" for name in paths],
+            "kml_dir": "output/kml_model",
+        },
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING: /polygons/perimeter_early skipped" in result.output
+    assert (
+        "WARNING: /polygons/perimeter_late skipped: its time 600.0 s is after the end of the simulation"
+        in result.output
+    )
+    with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
+        assert list(out_h5["polygons"]) == ["perimeter_mid"]
+        assert out_h5["polygons/perimeter_mid"].attrs["rel_path"].startswith("kml_model/")
+
+
+def test_a_section_the_data_cannot_give_is_skipped(kit):
+    config_path = _config(
+        kit,
+        burn_severity_cbi={"enabled": True, "group_path": "/spatial_2d/not_in_the_template"},
+        weather={"enabled": True},
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING: Section burn_severity_cbi skipped" in result.output
+    with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
+        assert "spatial_2d" not in out_h5
+        assert f"{TIME_SERIES}/station_in/{svn.AIR_TEMPERATURE.value}" in out_h5
+
+
+def test_an_unknown_perimeter_method_stops_before_writing(kit):
+    config_path = _config(
+        kit, perimeters={"enabled": True, "paths": ["/polygons/a"], "extraction_method": "guess"}
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code != 0
+    assert "perimeters.extraction_method must be one of" in result.output
     assert not (kit / "adapters" / "output" / "model.h5").exists()

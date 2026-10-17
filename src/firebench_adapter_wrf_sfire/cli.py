@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,17 @@ from firebench_adapter_wrf_sfire import (
     get_ravg_cc,
     get_weather_stations,
 )
+from firebench_adapter_wrf_sfire._skip import SkippedWarning, skip
+from firebench_adapter_wrf_sfire.perimeters import PERIMETER_EXTRACTION_METHODS
 
 DEFAULT_COMPRESSION_LVL = 3
 DEFAULT_FIRE_GRID_BOUND = 25
 DEFAULT_PERIMETER_KML_DIR = "kml_model"
 # Root attribute of a FireBench model-output template (firebench.benchmarks.fire_case_definition).
 TEMPLATE_ATTRIBUTE = "firebench_template"
+# A section that fails on the data is skipped, so one config serves simulations that give different
+# parts of a case. An unknown method (NotImplementedError) is a config error and stops the run.
+SECTION_ERRORS = (KeyError, IndexError, ValueError)
 
 
 @click.group()
@@ -61,8 +67,14 @@ def run(config_yml: Path) -> None:
     start_dt = _optional_datetime(main_config, "start_dt")
     end_dt = _optional_datetime(main_config, "end_dt")
 
-    if _section_enabled(config, "perimeters") and sfire_ref_time is None:
-        raise click.UsageError("main.sfire_ref_time is required when perimeters.enabled is true.")
+    if _section_enabled(config, "perimeters"):
+        if sfire_ref_time is None:
+            raise click.UsageError("main.sfire_ref_time is required when perimeters.enabled is true.")
+        extraction_method = _optional_mapping(config, "perimeters").get("extraction_method", "tign_g")
+        if extraction_method not in PERIMETER_EXTRACTION_METHODS:
+            raise click.UsageError(
+                f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
+            )
     if _section_enabled(config, "weather"):
         if sfire_ref_time is None:
             raise click.UsageError("main.sfire_ref_time is required when weather.enabled is true.")
@@ -76,37 +88,69 @@ def run(config_yml: Path) -> None:
     except FileExistsError as exc:
         raise click.UsageError(f"Output file already exists: {output_path}") from exc
 
-    try:
-        with h5py.File(obs_path, "r") as obs_h5, Dataset(wrf_path, "r") as wrf_dataset:
-            _run_severity(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
-            _run_building_damage(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
-            _run_ravg_cc(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
-            _run_burn_severity_cbi(config, new_h5, obs_h5, wrf_dataset, fire_grid_bound, compression_lvl)
-            _run_perimeters(
-                config,
-                config_dir,
-                new_h5,
-                obs_h5,
-                wrf_dataset,
-                sfire_ref_time,
-                fire_grid_bound,
-                overwrite,
-            )
-            _run_weather(
-                config,
-                new_h5,
-                obs_h5,
-                wrf_dataset,
-                sfire_ref_time,
-                start_dt,
-                end_dt,
-                fire_grid_bound,
-                compression_lvl,
-            )
-    finally:
-        new_h5.close()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SkippedWarning)
+        try:
+            with h5py.File(obs_path, "r") as obs_h5, Dataset(wrf_path, "r") as wrf_dataset:
+                common = (new_h5, obs_h5, wrf_dataset)
+                sections = (
+                    ("severity", lambda: _run_severity(config, *common, fire_grid_bound, compression_lvl)),
+                    (
+                        "building_damage",
+                        lambda: _run_building_damage(config, *common, fire_grid_bound, compression_lvl),
+                    ),
+                    ("ravg_cc", lambda: _run_ravg_cc(config, *common, fire_grid_bound, compression_lvl)),
+                    (
+                        "burn_severity_cbi",
+                        lambda: _run_burn_severity_cbi(config, *common, fire_grid_bound, compression_lvl),
+                    ),
+                    (
+                        "perimeters",
+                        lambda: _run_perimeters(
+                            config, config_dir, *common, sfire_ref_time, fire_grid_bound, overwrite
+                        ),
+                    ),
+                    (
+                        "weather",
+                        lambda: _run_weather(
+                            config,
+                            *common,
+                            sfire_ref_time,
+                            start_dt,
+                            end_dt,
+                            fire_grid_bound,
+                            compression_lvl,
+                        ),
+                    ),
+                )
+                shown = 0
+                for section_name, run_section in sections:
+                    try:
+                        run_section()
+                    except SECTION_ERRORS as exc:
+                        skip(f"Section {section_name}", exc)
+                    shown = _echo_skipped(caught, shown)
+        finally:
+            new_h5.close()
 
+    skipped = [item for item in caught if issubclass(item.category, SkippedWarning)]
+    for item in caught:
+        if not issubclass(item.category, SkippedWarning):
+            warnings.showwarning(item.message, item.category, item.filename, item.lineno)
     click.echo(f"Wrote {output_path}")
+    if skipped:
+        click.echo(
+            f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
+            err=True,
+        )
+
+
+def _echo_skipped(caught: list[warnings.WarningMessage], shown: int) -> int:
+    """Echo the skipped items recorded since ``shown``, and return the new count."""
+    for item in caught[shown:]:
+        if issubclass(item.category, SkippedWarning):
+            click.echo(f"WARNING: {item.message}", err=True)
+    return len(caught)
 
 
 def _load_config(config_yml: Path) -> dict[str, Any]:

@@ -77,6 +77,21 @@ run: at most 0.2 is high (4), at most 0.6 moderate (3), at most 0.8 low (2), and
 `burn_severity_cbi.cbi_thresholds` changes the three bounds. A cell of the template's grid outside the
 fire grid is left at the template's `_FillValue`, which FireBench does not score.
 
+### What the simulation cannot give
+
+The adapter writes what the simulation can give and skips the rest, so the same config serves a short
+test run and the full run. Each skipped item is printed as `WARNING:`, the count at the end, and the
+run still exits 0:
+
+- a perimeter before ignition, after the last output time of the simulation, or without a polygon;
+- a weather station outside the atmospheric grid, or with no observation time inside the simulation;
+- a variable whose WRF-SFIRE fields (`WZ0`, `Q2`, `FMC_GC`, …) or sensor height are missing;
+- a whole section that fails on the data (for example `FUEL_FRAC` missing for `burn_severity_cbi`).
+
+A station keeps only the observation times the simulation covers. The site then tells which periods
+and KPI groups the output can be scored on. A config error, such as an unknown method, still stops
+the run before anything is written.
+
 ## 5. Submit
 
 Zip the `output/` folder, so the HDF5 file and its `kml_model/` folder are together, and submit the zip

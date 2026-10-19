@@ -43,6 +43,8 @@ The adapter exposes functions for converting WRF-SFIRE output into FireBench-sta
 - `get_mtbs_severity_surf`
 - `get_building_damage`
 - `get_ravg_cc`
+- `get_ravg_cbi_severity`
+- `get_fire_total`
 - `get_perimeters_from_t_ign_g`
 - `get_weather_stations`
 
@@ -52,7 +54,7 @@ fb-sfire run config.yml
 ```
 
 The config contains a `main` section for shared paths and times, plus dedicated sections such as
-`severity`, `building_damage`, `ravg_cc`, `perimeters`, and `weather`. `main.wrf_path` is the folder
+`severity`, `building_damage`, `ravg_cc`, `burn_severity_cbi`, `perimeters`, `weather`, and `frp`. `main.wrf_path` is the folder
 of the run (every `wrfout_dNN_*` file, each value from the finest domain that holds it) or one file.
 
 To enter a benchmark case of the FireBench Foundation site (`FBF-` cases), download the case's

@@ -93,6 +93,25 @@ class WrfDomain:
         """A field at the last output time of the run, as netCDF4 reads it."""
         return self.variable(variable, self.datasets[-1], 3)[-1, grid_slice, grid_slice]
 
+    def at(self, variable: str, index: int, grid_slice: slice) -> np.ndarray:
+        """A field at output time ``index`` of ``xtime()``."""
+        self.xtime()
+        for dataset, local, first in self._pieces:
+            if first <= index < first + local.size:
+                values = self.variable(variable, dataset, 3)[local[index - first], grid_slice, grid_slice]
+                return np.asarray(np.ma.getdata(values))
+        raise IndexError(f"{self.name} has no output time {index}")
+
+    def maximum(self, variable: str, grid_slice: slice) -> np.ndarray:
+        """The largest value of a field at each cell over every output time."""
+        largest = None
+        for index in range(self.xtime().size):
+            values = self.at(variable, index, grid_slice)
+            largest = values if largest is None else np.maximum(largest, values)
+        if largest is None:
+            raise ValueError(f"{self.name} has no output time")
+        return largest
+
     def series(self, variable: str, time_slice: slice, *point: int) -> np.ndarray:
         """The values of ``variable`` at ``point`` (layer, j, i or j, i) over ``time_slice`` of xtime()."""
         self.xtime()

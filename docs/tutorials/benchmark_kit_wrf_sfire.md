@@ -56,6 +56,13 @@ building_damage:
   group_path: null
 weather:
   enabled: true
+ravg_cc:
+  enabled: true
+  group_path: /spatial_2d/ravg_cc
+frp:
+  enabled: true
+  group_path: /time_series/fire_total
+  conversion_factor: [5, 10]
 ```
 
 Relative paths are resolved from the folder of the config. `wrf_path` is the folder that holds the
@@ -84,6 +91,20 @@ run: at most 0.2 is high (4), at most 0.6 moderate (3), at most 0.8 low (2), and
 `burn_severity_cbi.cbi_thresholds` changes the three bounds. A cell of the template's grid outside the
 fire grid is left at the template's `_FillValue`, which FireBench does not score.
 
+The `ravg_cc` section writes RAVG's five classes of canopy cover loss from the fraction of canopy each
+cell burnt over the run, `CAN_FRAC_BURNT` (else the largest `CFB` of the output times): 0 is 1 (0 %),
+above 0 is 2, from 0.25 is 3, from 0.5 is 4, and from 0.75 is 5. A cell the fire did not burn
+(`FIRE_AREA` below 0.5) is 9, outside the burn area, and a cell outside the fire grid is 0, no data.
+FireBench scores the classes only where the model and RAVG both say the cell burnt: where it burns is
+the perimeters' question.
+
+The `frp` section writes the fire radiative power the run gives over the frame of the case, at every
+output time, as a band: the sensible heat released over the frame (`FGRNHFX` + `FCANHFX` times the
+area of each fire cell inside the frame, in MW) divided by the largest and by the smallest
+`conversion_factor`. The default `[5, 10]` takes the heat flux to be 5 to 10 times the FRP. FireBench
+scores the share of satellite observations inside the band. The frame comes from the template; with
+an observation file as reference, give it as `frp.frame: [west, south, east, north]`.
+
 ### What the simulation cannot give
 
 The adapter writes what the simulation can give and skips the rest, so the same config serves a short
@@ -110,7 +131,8 @@ of d02`). To score every family, keep these variables in the output:
 | `perimeters` | `TIGN_G` |
 | `burn_severity_cbi`, `severity` | `FUEL_FRAC` (the last output file is enough) |
 | `building_damage` | `FIRE_AREA` |
-| `ravg_cc` | `FIRE_AREA`, `CFB` |
+| `ravg_cc` | `FIRE_AREA`, `CAN_FRAC_BURNT` (or `CFB` at every output time) |
+| `frp` | `FGRNHFX` and `FCANHFX` at every output time (or `GRNHFX` and `CANHFX`) |
 | `weather` | `T2`, `Q2`, `PSFC`, `U10`, `V10`, `COSALPHA`, `SINALPHA`, `WZ0` (fire domain) or `ZNT`, `FMC_GC` |
 
 `FMC_GC` may hold every fuel class (`weather.i_fmc_10h` picks the 10-hour class, 1 by default) or the

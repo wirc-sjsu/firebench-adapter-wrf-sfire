@@ -13,6 +13,7 @@ import yaml
 import firebench.standardize as fs
 from firebench_adapter_wrf_sfire import (
     get_building_damage,
+    get_fire_total,
     get_mtbs_severity_surf,
     get_perimeters_from_t_ign_g,
     get_ravg_cbi_severity,
@@ -21,6 +22,7 @@ from firebench_adapter_wrf_sfire import (
 )
 from firebench_adapter_wrf_sfire._skip import SkippedWarning, skip
 from firebench_adapter_wrf_sfire._wrfout import WrfRun, open_run
+from firebench_adapter_wrf_sfire.frp import DEFAULT_CONVERSION_FACTOR, DEFAULT_GROUP_PATH
 from firebench_adapter_wrf_sfire.perimeters import PERIMETER_EXTRACTION_METHODS
 
 DEFAULT_COMPRESSION_LVL = 3
@@ -82,6 +84,8 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             raise click.UsageError(
                 f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
             )
+    if _section_enabled(config, "frp"):
+        _check_frp_section(_optional_mapping(config, "frp"))
     if _section_enabled(config, "weather"):
         if start_dt is None or end_dt is None:
             raise click.UsageError(
@@ -134,7 +138,7 @@ def _run_ref_time(run_files: WrfRun, sfire_ref_time: str | None, config: dict[st
         click.echo(f"WRF-SFIRE domain {domain.describe()}")
     if sfire_ref_time is not None:
         return sfire_ref_time
-    if not (_section_enabled(config, "perimeters") or _section_enabled(config, "weather")):
+    if not any(_section_enabled(config, name) for name in ("perimeters", "weather", "frp")):
         return None
     try:
         sfire_ref_time = run_files.start_time()
@@ -193,6 +197,10 @@ def _run_sections(  # pylint: disable=too-many-arguments
                             fire_grid_bound,
                             compression_lvl,
                         ),
+                    ),
+                    (
+                        "frp",
+                        lambda: _run_frp(config, *common, sfire_ref_time, fire_grid_bound, compression_lvl),
                     ),
                 )
                 shown = 0
@@ -360,6 +368,7 @@ def _enabled_processing_sections(config: dict[str, Any]) -> list[str]:
             "burn_severity_cbi",
             "perimeters",
             "weather",
+            "frp",
         )
         if _section_enabled(config, section_name)
     ]
@@ -442,6 +451,51 @@ def _run_ravg_cc(
         _required_str(section, "group_path"),
         wrf_dataset,
         method=section.get("method", "cfb"),
+        fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
+        compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+    )
+
+
+def _numbers(value, count: int) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == count
+        and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+    )
+
+
+def _check_frp_section(section: dict[str, Any]) -> None:
+    """Refuse an frp section the run could not use, before anything is written."""
+    factor = section.get("conversion_factor", list(DEFAULT_CONVERSION_FACTOR))
+    if not _numbers(factor, 2) or not 0 < factor[0] <= factor[1]:
+        raise click.UsageError("frp.conversion_factor must be [smallest, largest], both above 0.")
+    frame = section.get("frame")
+    if frame is not None and not _numbers(frame, 4):
+        raise click.UsageError("frp.frame must be [west, south, east, north].")
+
+
+def _run_frp(  # pylint: disable=too-many-arguments
+    config: dict[str, Any],
+    new_h5: h5py.File,
+    obs_h5: h5py.File,
+    wrf_dataset: WrfRun,
+    sfire_ref_time: str | None,
+    fire_grid_bound: int,
+    compression_lvl: int,
+) -> None:
+    section = _optional_mapping(config, "frp")
+    if not section.get("enabled", False):
+        return
+
+    click.echo("Process Fire Radiative Power")
+    get_fire_total(
+        new_h5,
+        obs_h5,
+        section.get("group_path", DEFAULT_GROUP_PATH),
+        wrf_dataset,
+        sfire_ref_time,
+        conversion_factor=section.get("conversion_factor", list(DEFAULT_CONVERSION_FACTOR)),
+        frame=section.get("frame"),
         fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
         compression_lvl=int(section.get("compression_lvl", compression_lvl)),
     )

@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A 3D `FMC_GC` (the 10-hour class alone) is told from a 4D one by its dimensions; `weather.i_fmc_10h: null` is no longer needed for it.
 
 ### Fixed
+- A weather station whose simulation covers a single observation time, at an output time of the run, gets the model's value there instead of NaN (and scipy's `invalid value encountered in divide`).
 - Python 3.10 and 3.11: reading a run no longer stops with `TypeError: unhashable type: 'slice'`.
 - Weather stations with `fire_grid_bound` above 0 read the grid cell nearest to them: the nearest point was found on the trimmed grid and its indices read on the full one, `fire_grid_bound` cells away (atmospheric variables and `WZ0`).
 

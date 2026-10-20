@@ -11,6 +11,7 @@ from netCDF4 import Dataset
 
 from firebench_adapter_wrf_sfire import get_weather_stations
 from firebench_adapter_wrf_sfire.cli import main
+from firebench_adapter_wrf_sfire.wx import _interp_linear_1d_strict
 
 
 @pytest.mark.parametrize(
@@ -108,3 +109,11 @@ def test_weather_station_fmc_layouts(tmp_path, fmc_options, expected, entrypoint
         np.testing.assert_allclose(result[:], expected)
         assert result.attrs["units"] == "dimensionless"
         np.testing.assert_array_equal(out_h5[f"{station_path}/time"][:], obs_time)
+
+
+def test_one_model_time_gives_its_float32_value():
+    """WRF writes float32: one output time at the one observation time is that value, not NaN."""
+    result = _interp_linear_1d_strict(
+        np.array([3600.0]), np.array([290.5], dtype=np.float32), np.array([3600.0])
+    )
+    np.testing.assert_array_equal(result, [290.5])

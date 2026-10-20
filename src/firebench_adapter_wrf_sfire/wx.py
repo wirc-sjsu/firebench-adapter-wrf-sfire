@@ -161,10 +161,13 @@ def _interp_linear_1d_strict(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np
     """
     Linear interpolation with the same settings as your current usage:
     bounds_error=True, fill_value=np.nan, assume_sorted=True.
+
+    ``y`` is read as float64: on WRF's float32 values scipy takes its own linear path, which gives NaN
+    when ``x`` holds a single time (a station whose one observation time is an output time).
     """
     f = interp1d(
         x,
-        y,
+        np.asarray(y, dtype=np.float64),
         kind="linear",
         bounds_error=True,
         fill_value=np.nan,

@@ -102,6 +102,20 @@ class WrfDomain:
                 return np.asarray(np.ma.getdata(values))
         raise IndexError(f"{self.name} has no output time {index}")
 
+    def box(self, variable: str, rows: slice, cols: slice) -> np.ndarray:
+        """A 2D field (south_north, west_east) cut to ``rows`` and ``cols``, from the first output time."""
+        return np.array(np.ma.getdata(self.variable(variable, ndim=3)[0, rows, cols]))
+
+    def volume(self, variable: str, index: int, rows: slice, cols: slice) -> np.ndarray:
+        """A 3D field (bottom_top, south_north, west_east) at output time ``index`` of ``xtime()``,
+        cut to ``rows`` and ``cols``; the staggered dimension, if any, as the file gives it."""
+        self.xtime()
+        for dataset, local, first in self._pieces:
+            if first <= index < first + local.size:
+                values = self.variable(variable, dataset, 4)[local[index - first], :, rows, cols]
+                return np.asarray(np.ma.getdata(values))
+        raise IndexError(f"{self.name} has no output time {index}")
+
     def series(self, variable: str, time_slice: slice, *point: int) -> np.ndarray:
         """The values of ``variable`` at ``point`` (layer, j, i or j, i) over ``time_slice`` of xtime()."""
         self.xtime()

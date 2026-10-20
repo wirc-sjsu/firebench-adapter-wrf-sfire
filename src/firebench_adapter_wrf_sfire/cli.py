@@ -16,6 +16,7 @@ from firebench_adapter_wrf_sfire import (
     get_fire_total,
     get_mtbs_severity_surf,
     get_perimeters_from_t_ign_g,
+    get_plume,
     get_ravg_cbi_severity,
     get_ravg_cc,
     get_weather_stations,
@@ -24,6 +25,7 @@ from firebench_adapter_wrf_sfire._skip import SkippedWarning, skip
 from firebench_adapter_wrf_sfire._wrfout import WrfRun, open_run
 from firebench_adapter_wrf_sfire.frp import DEFAULT_CONVERSION_FACTOR, DEFAULT_GROUP_PATH
 from firebench_adapter_wrf_sfire.perimeters import PERIMETER_EXTRACTION_METHODS
+from firebench_adapter_wrf_sfire.plume import DEFAULT_MAX_TIME_GAP, DEFAULT_TRACER, TRACER_NAME
 
 DEFAULT_COMPRESSION_LVL = 3
 DEFAULT_FIRE_GRID_BOUND = 25
@@ -84,8 +86,7 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             raise click.UsageError(
                 f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
             )
-    if _section_enabled(config, "frp"):
-        _check_frp_section(_optional_mapping(config, "frp"))
+    _check_band_and_plume(config)
     if _section_enabled(config, "weather"):
         if start_dt is None or end_dt is None:
             raise click.UsageError(
@@ -138,7 +139,7 @@ def _run_ref_time(run_files: WrfRun, sfire_ref_time: str | None, config: dict[st
         click.echo(f"WRF-SFIRE domain {domain.describe()}")
     if sfire_ref_time is not None:
         return sfire_ref_time
-    if not any(_section_enabled(config, name) for name in ("perimeters", "weather", "frp")):
+    if not any(_section_enabled(config, name) for name in ("perimeters", "weather", "frp", "plume")):
         return None
     try:
         sfire_ref_time = run_files.start_time()
@@ -202,6 +203,7 @@ def _run_sections(  # pylint: disable=too-many-arguments
                         "frp",
                         lambda: _run_frp(config, *common, sfire_ref_time, fire_grid_bound, compression_lvl),
                     ),
+                    ("plume", lambda: _run_plume(config, *common, sfire_ref_time, compression_lvl)),
                 )
                 shown = 0
                 for section_name, run_section in sections:
@@ -369,6 +371,7 @@ def _enabled_processing_sections(config: dict[str, Any]) -> list[str]:
             "perimeters",
             "weather",
             "frp",
+            "plume",
         )
         if _section_enabled(config, section_name)
     ]
@@ -464,6 +467,14 @@ def _numbers(value, count: int) -> bool:
     )
 
 
+def _check_band_and_plume(config: dict[str, Any]) -> None:
+    """Refuse an enabled frp or plume section the run could not use."""
+    if _section_enabled(config, "frp"):
+        _check_frp_section(_optional_mapping(config, "frp"))
+    if _section_enabled(config, "plume"):
+        _check_plume_section(_optional_mapping(config, "plume"))
+
+
 def _check_frp_section(section: dict[str, Any]) -> None:
     """Refuse an frp section the run could not use, before anything is written."""
     factor = section.get("conversion_factor", list(DEFAULT_CONVERSION_FACTOR))
@@ -499,6 +510,63 @@ def _run_frp(  # pylint: disable=too-many-arguments
         fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
         compression_lvl=int(section.get("compression_lvl", compression_lvl)),
     )
+
+
+def _plume_points(section: dict[str, Any]) -> dict[str, Any] | None:
+    """The points of the plume for figures: the defaults, the values given, or None when false."""
+    points = section.get("points", {})
+    if points is False:
+        return None
+    return {} if points is None or points is True else points
+
+
+def _check_plume_section(section: dict[str, Any]) -> None:
+    """Refuse a plume section the run could not use, before anything is written."""
+    tracer = section.get("tracer", DEFAULT_TRACER)
+    if not isinstance(tracer, str) or not TRACER_NAME.fullmatch(tracer):
+        raise click.UsageError("plume.tracer must be one of tr17_1 to tr17_8.")
+    gap = section.get("max_time_gap", DEFAULT_MAX_TIME_GAP)
+    if not _numbers([gap], 1) or gap <= 0:
+        raise click.UsageError("plume.max_time_gap must be a number of seconds above 0.")
+    domain = section.get("domain")
+    if domain is not None and (not isinstance(domain, str) or not domain.startswith("d")):
+        raise click.UsageError("plume.domain must name a domain, such as d02, or be left out.")
+    points = _plume_points(section)
+    if points is not None:
+        if not isinstance(points, dict) or set(points) - {"max_per_time", "every_s"}:
+            raise click.UsageError("plume.points may give max_per_time and every_s, or be false.")
+        for key in ("max_per_time", "every_s"):
+            if key in points and (not _numbers([points[key]], 1) or points[key] <= 0):
+                raise click.UsageError(f"plume.points.{key} must be a number above 0.")
+
+
+def _run_plume(  # pylint: disable=too-many-arguments
+    config: dict[str, Any],
+    new_h5: h5py.File,
+    obs_h5: h5py.File,
+    wrf_dataset: WrfRun,
+    sfire_ref_time: str | None,
+    compression_lvl: int,
+) -> None:
+    section = _optional_mapping(config, "plume")
+    if not section.get("enabled", False):
+        return
+
+    tracer = section.get("tracer", DEFAULT_TRACER)
+    click.echo(f"Process Radar Plume ({tracer})")
+    written = get_plume(
+        new_h5,
+        obs_h5.filename,
+        wrf_dataset,
+        sfire_ref_time,
+        tracer=tracer,
+        domain=section.get("domain"),
+        max_time_gap=float(section.get("max_time_gap", DEFAULT_MAX_TIME_GAP)),
+        points=_plume_points(section),
+        compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+    )
+    for target, count in written.items():
+        click.echo(f"  {target}: {count} time(s)")
 
 
 def _run_burn_severity_cbi(

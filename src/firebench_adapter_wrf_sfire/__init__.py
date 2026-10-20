@@ -6,6 +6,7 @@ from ._wrfout import WrfRun, open_run
 from .building_damage import get_building_damage
 from .frp import get_fire_total
 from .perimeters import get_perimeters_from_t_ign_g
+from .plume import get_plume
 from .ravg import get_ravg_cc
 from .severity_cbi import get_ravg_cbi_severity
 from .severity_mtbs import get_mtbs_severity_surf
@@ -24,6 +25,7 @@ __all__ = [
     "get_building_damage",
     "get_fire_total",
     "get_perimeters_from_t_ign_g",
+    "get_plume",
     "get_ravg_cc",
     "get_ravg_cbi_severity",
     "get_mtbs_severity_surf",

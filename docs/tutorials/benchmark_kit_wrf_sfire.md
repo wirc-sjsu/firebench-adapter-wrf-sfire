@@ -63,6 +63,11 @@ frp:
   enabled: true
   group_path: /time_series/fire_total
   conversion_factor: [5, 10]
+plume:
+  enabled: true
+  tracer: tr17_1                                      # the fire tracer compared with the radar
+  max_time_gap: 1800
+  points: {max_per_time: 20000, every_s: 900}
 ```
 
 Relative paths are resolved from the folder of the config. `wrf_path` is the folder that holds the
@@ -105,6 +110,24 @@ output time, as a band: the sensible heat released over the frame, surface and c
 scores the share of satellite observations inside the band. The frame comes from the template; with
 an observation file as reference, give it as `frp.frame: [west, south, east, north]`.
 
+The `plume` section writes the run's plume where and when the radar saw it, for FireBench's
+`radar_plume` family: one of WRF-SFIRE's fire tracers, `tr17_1` to `tr17_8` (`plume.tracer`, `tr17_1`
+by default), and the wind, on the nodes of each radar cross section of the case at the start of each
+radar volume, and, for the radars of `echo_top`, the count of the model's plume cells over the radar's
+frame in bins of height. The template gives these targets. Every domain that holds the tracer gives
+them, so the plume is followed past the nests: each position (a node of a section, a column of a
+frame) comes from the finest domain that holds the tracer and covers it, and each domain is read cut
+to the cells around the positions it gives. Over a frame given by several domains, each cell counts
+for its area, so a nest does not outweigh the grid around it. `plume.domain: d01` takes every
+position from one domain, NaN where it does not reach. The wind is destaggered to the mass points and
+turned to east and north with `COSALPHA` and `SINALPHA`; heights come from `PH` + `PHB`. A radar time
+between two output times takes both, linearly in time; a time outside the run, or between outputs
+more than `max_time_gap` seconds apart, stays NaN, and FireBench leaves that volume out. The output
+holds no 3D field: the run stays where it ran. `plume.points` also keeps up to `max_per_time` plume
+cells every `every_s` seconds for the site's 3D figures (`points: false` leaves them out); they are
+never scored. The tracer's scale does not matter: FireBench compares where it reaches a share of its
+largest value.
+
 ### What the simulation cannot give
 
 The adapter writes what the simulation can give and skips the rest, so the same config serves a short
@@ -133,6 +156,7 @@ of d02`). To score every family, keep these variables in the output:
 | `building_damage` | `FIRE_AREA` |
 | `ravg_cc` | `FIRE_AREA`, `CFB` (the last output file is enough) |
 | `frp` | `FGRNHFX` and `FCANHFX` at every output time |
+| `plume` | the tracer (`tr17_1` … `tr17_8`), `PH`, `PHB`, `U`, `V`, `W`, `COSALPHA`, `SINALPHA` at every output time around the radar's volumes |
 | `weather` | `T2`, `Q2`, `PSFC`, `U10`, `V10`, `COSALPHA`, `SINALPHA`, `WZ0` (fire domain) or `ZNT`, `FMC_GC` |
 
 `FMC_GC` may hold every fuel class (`weather.i_fmc_10h` picks the 10-hour class, 1 by default) or the

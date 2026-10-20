@@ -1,4 +1,4 @@
-"""The FRP band of a run, from its sensible heat flux, and RAVG canopy cover loss from its canopy burnt."""
+"""The FRP band of a run, from its sensible heat flux, and RAVG canopy cover loss from its CFB."""
 
 import h5py
 import numpy as np
@@ -118,7 +118,7 @@ def test_the_frp_band_is_the_sensible_heat_over_the_frame_divided_by_the_factors
         assert group["fire_radiative_power_upper"].attrs["units"] == "MW"
         np.testing.assert_array_equal(group["time"][:], [0.0, 1800.0, 3600.0])
         assert group["time"].attrs["time_origin"] == "2026-01-01T00:00:00Z"
-        assert group.attrs["heat_flux_variables"] == "FCANHFX,FGRNHFX"
+        assert group.attrs["heat_flux_variables"] == "FGRNHFX+FCANHFX"
         assert (group.attrs["conversion_factor_min"], group.attrs["conversion_factor_max"]) == (5.0, 10.0)
         assert [group.attrs[key] for key in ("frame_west", "frame_east")] == [FRAME[0], FRAME[2]]
 
@@ -128,9 +128,11 @@ def test_a_finer_fire_domain_takes_its_cells_from_the_coarser_one(case):
     folder.mkdir()
     # d01: 6 x 6 cells of 0.01 degree, 100 W m-2; d02, inside it: 3 x 3 cells of 0.005 degree, 1000.
     lat, lon = _grid(38.985, -121.015, 6, STEP)
-    _write_wrfout(folder / "wrfout_d01_2026-01-01_00:00:00", lat, lon, {"FGRNHFX": 100.0})
+    _write_wrfout(folder / "wrfout_d01_2026-01-01_00:00:00", lat, lon, {"FGRNHFX": 100.0, "FCANHFX": 0.0})
     lat2, lon2 = _grid(39.0, -121.0, 3, STEP / 2)
-    _write_wrfout(folder / "wrfout_d02_2026-01-01_00:00:00", lat2, lon2, {"FGRNHFX": 1000.0})
+    _write_wrfout(
+        folder / "wrfout_d02_2026-01-01_00:00:00", lat2, lon2, {"FGRNHFX": 1000.0, "FCANHFX": 0.0}
+    )
     frame = [-121.1, 38.9, -120.9, 39.1]
 
     result = _run(_config(case, folder, frp={"enabled": True, "frame": frame}))
@@ -144,30 +146,27 @@ def test_a_finer_fire_domain_takes_its_cells_from_the_coarser_one(case):
     np.testing.assert_allclose(heat, np.full(3, (fine + coarse) / 1e6), rtol=1e-6)
 
 
-def test_without_a_fire_grid_flux_the_atmosphere_s_is_used(case):
-    run = _one_domain(case / "run", GRNHFX=1000.0)
+def test_the_frp_needs_the_canopy_heat_flux_too(case):
+    # The atmosphere grid's GRNHFX and CANHFX are not a substitute for the fire grid's fluxes.
+    run = _one_domain(case / "run", FGRNHFX=1000.0, GRNHFX=1000.0, CANHFX=0.0)
 
     result = _run(_config(case, run, frp={"enabled": True}))
 
     assert result.exit_code == 0, result.output
+    assert "Section frp skipped: 'FCANHFX not in the output of d01'" in result.output
     with h5py.File(case / "output" / "model.h5", "r") as out_h5:
-        group = out_h5[FRP_GROUP]
-        assert group.attrs["heat_flux_variables"] == "GRNHFX"
-        area = 2 * _cell_area(39.0) + 2 * _cell_area(39.01)
-        np.testing.assert_allclose(
-            group["heat_release_rate_sensible"][:], np.full(3, area * 1e-3), rtol=1e-6
-        )
+        assert FRP_GROUP not in out_h5
 
 
 def test_a_run_without_heat_flux_skips_the_frp(case):
-    run = _one_domain(case / "run", FIRE_AREA=_burnt(), CAN_FRAC_BURNT=0.3)
+    run = _one_domain(case / "run", FIRE_AREA=_burnt(), CFB=0.3)
 
     result = _run(
         _config(case, run, frp={"enabled": True}, ravg_cc={"enabled": True, "group_path": CC_GROUP})
     )
 
     assert result.exit_code == 0, result.output
-    assert "Section frp skipped: 'neither FGRNHFX nor GRNHFX is in the output of d01'" in result.output
+    assert "Section frp skipped: 'FGRNHFX and FCANHFX not in the output of d01'" in result.output
     with h5py.File(case / "output" / "model.h5", "r") as out_h5:
         assert FRP_GROUP not in out_h5
         assert CC_PATH in out_h5
@@ -192,10 +191,13 @@ def test_a_conversion_factor_upside_down_stops_before_writing(case):
     assert not (case / "output" / "model.h5").exists()
 
 
-def test_canopy_cover_loss_takes_the_canopy_burnt_over_the_run(case):
-    # CFB is 0.8 at 00:30 only, after the front, 0; CAN_FRAC_BURNT, its running maximum, says 0.3.
+def test_canopy_cover_loss_is_the_crown_fraction_burnt_at_the_last_output_time(case):
+    # CFB is 0.8 at 00:30 and 0.3 at the end; CAN_FRAC_BURNT is not read.
     run = _one_domain(
-        case / "run", FIRE_AREA=_burnt(), CFB=lambda t: 0.8 if t == 30.0 else 0.0, CAN_FRAC_BURNT=0.3
+        case / "run",
+        FIRE_AREA=_burnt(),
+        CFB=lambda t: {0.0: 0.0, 30.0: 0.8}.get(t, 0.3),
+        CAN_FRAC_BURNT=0.9,
     )
 
     result = _run(_config(case, run, ravg_cc={"enabled": True, "group_path": CC_GROUP}))
@@ -207,21 +209,11 @@ def test_canopy_cover_loss_takes_the_canopy_burnt_over_the_run(case):
         assert out_h5[CC_PATH].attrs["_FillValue"] == 0
 
 
-def test_without_can_frac_burnt_the_largest_cfb_is_used(case):
-    run = _one_domain(case / "run", FIRE_AREA=_burnt(), CFB=lambda t: 0.8 if t == 30.0 else 0.0)
+def test_without_cfb_the_canopy_cover_loss_is_skipped(case):
+    run = _one_domain(case / "run", FIRE_AREA=_burnt(), CAN_FRAC_BURNT=0.3)
 
     result = _run(_config(case, run, ravg_cc={"enabled": True, "group_path": CC_GROUP}))
 
-    assert result.exit_code == 0, result.output
-    with h5py.File(case / "output" / "model.h5", "r") as out_h5:
-        np.testing.assert_array_equal(out_h5[CC_PATH][:], [[9, 5, 0]])
-
-
-def test_without_canopy_burnt_the_canopy_cover_loss_is_skipped(case):
-    run = _one_domain(case / "run", FIRE_AREA=_burnt())
-
-    result = _run(_config(case, run, ravg_cc={"enabled": True, "group_path": CC_GROUP}))
-
-    assert "Section ravg_cc skipped" in result.output and "neither CAN_FRAC_BURNT nor CFB" in result.output
+    assert "Section ravg_cc skipped" in result.output and "CFB is not in the output of d01" in result.output
     with h5py.File(case / "output" / "model.h5", "r") as out_h5:
         assert CC_PATH not in out_h5

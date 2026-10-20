@@ -15,9 +15,8 @@ from ._wrfout import WrfRun, as_run
 DEFAULT_GROUP_PATH = "/time_series/fire_total"
 # The sensible heat flux is taken to be 5 to 10 times the FRP: FRP = heat / k, k in [5, 10].
 DEFAULT_CONVERSION_FACTOR = (5.0, 10.0)
-# Heat fluxes of the ground and the crown fire, in W m-2: on the fire grid, else on the atmosphere grid.
+# Heat fluxes of the surface and the canopy fire on the fire grid, in W m-2.
 FIRE_GRID_FLUXES = ("FGRNHFX", "FCANHFX")
-ATMOSPHERE_FLUXES = ("GRNHFX", "CANHFX")
 FRAME_KEYS = ("frame_west", "frame_south", "frame_east", "frame_north")
 EARTH_RADIUS = 6_371_000.0
 LOWER = "fire_radiative_power_lower"
@@ -64,9 +63,9 @@ def get_fire_total(  # pylint: disable=too-many-arguments,too-many-locals
 ):
     """Write the FRP band of the run over a frame at every output time, in ``group_path``.
 
-    The sensible heat released over the frame is the heat flux of the ground and of the crown fire
-    (FGRNHFX + FCANHFX, else GRNHFX + CANHFX on the atmosphere grid) times the area of each cell inside
-    the frame, a cell taken from the finest fire domain that holds it. The FRP band is that heat
+    The sensible heat released over the frame is the heat flux of the surface and of the canopy fire
+    on the fire grid (FGRNHFX + FCANHFX) times the area of each fire cell inside the frame, a cell
+    taken from the finest fire domain that holds it. The FRP band is that heat
     divided by the largest and by the smallest ``conversion_factor``. The frame is the reference's
     (``frame_west`` ... attributes of ``group_path`` in a benchmark kit's template) unless given.
     ``ref_time`` is the time XTIME counts from.
@@ -82,34 +81,28 @@ def get_fire_total(  # pylint: disable=too-many-arguments,too-many-locals
 
     plan = []
     for index, domain in enumerate(domains):
-        names = [name for name in FIRE_GRID_FLUXES if domain.has(name)]
-        fire = bool(names) and "FGRNHFX" in names
-        if not fire:
-            names = [name for name in ATMOSPHERE_FLUXES if domain.has(name)]
-        if not names:
-            raise KeyError(f"neither FGRNHFX nor GRNHFX is in the output of {domain.name}")
-        # The atmosphere grid has no padding to trim.
-        domain_slice = grid_slice if fire else slice(None)
-        lat_name, lon_name = ("FXLAT", "FXLONG") if fire else ("XLAT", "XLONG")
-        lat, lon = domain.static(lat_name, domain_slice), domain.static(lon_name, domain_slice)
+        missing = [name for name in FIRE_GRID_FLUXES if not domain.has(name)]
+        if missing:
+            raise KeyError(f"{' and '.join(missing)} not in the output of {domain.name}")
+        lat, lon = domain.static("FXLAT", grid_slice), domain.static("FXLONG", grid_slice)
         inside = (lon >= west) & (lon <= east) & (lat >= south) & (lat <= north)
         for finer in domains[:index]:
             inside &= ~finer.covers(lat, lon, grid_slice, fire=True)
-        plan.append((domain, names, domain_slice, inside, cell_area(lat, lon)))
-    if not any(inside.any() for _, _, _, inside, _ in plan):
+        plan.append((domain, inside, cell_area(lat, lon)))
+    if not any(inside.any() for _, inside, _ in plan):
         raise ValueError(
             f"no cell of the run's fire domains is inside the frame {[west, south, east, north]}"
         )
 
     times = reduce(np.intersect1d, [domain.xtime() for domain in domains])
     heat = np.zeros(times.size)
-    for domain, names, domain_slice, inside, area in plan:
+    for domain, inside, area in plan:
         weights = area[inside]
         for position, index in enumerate(np.searchsorted(domain.xtime(), times)):
-            for name in names:
-                heat[position] += np.sum(domain.at(name, int(index), domain_slice)[inside] * weights)
+            for name in FIRE_GRID_FLUXES:
+                heat[position] += np.sum(domain.at(name, int(index), grid_slice)[inside] * weights)
     heat_mw = heat / 1e6
-    variables = ",".join(sorted({name for _, names, _, _, _ in plan for name in names}))
+    variables = "+".join(FIRE_GRID_FLUXES)
 
     group = new_h5.require_group(group_path)
     for key, value in zip(FRAME_KEYS, (west, south, east, north)):

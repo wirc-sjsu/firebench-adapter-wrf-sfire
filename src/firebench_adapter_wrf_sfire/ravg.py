@@ -29,18 +29,16 @@ def __compute_canopy_cover_loss_from_cfb(Nx, Ny, fire_area, cfb):
     return ccl
 
 
-def canopy_fraction_burnt(domain, grid_slice: slice) -> np.ndarray:
-    """The fraction of canopy each fire cell burnt over the run.
+def crown_fraction_burnt(domain, grid_slice: slice) -> np.ndarray:
+    """The crown fraction each fire cell burnt, CFB at the last output time.
 
-    CAN_FRAC_BURNT is WRF-SFIRE's running maximum of CFB while the front crosses a cell; CFB alone is
-    the fraction at the time of an output, 0 once the front has passed, so its largest value over the
-    output times stands in for a run that does not write CAN_FRAC_BURNT.
+    WRF-SFIRE computes CFB near the front and in a burnt cell until its canopy is older than
+    fire_crown_ros_age_factor burn times, then leaves it: at the end of the run CFB is the map of the
+    canopy the fire consumed, what RAVG's canopy cover loss measures.
     """
-    if domain.has("CAN_FRAC_BURNT"):
-        return np.array(domain.last("CAN_FRAC_BURNT", grid_slice))
-    if domain.has("CFB"):
-        return domain.maximum("CFB", grid_slice)
-    raise KeyError(f"neither CAN_FRAC_BURNT nor CFB is in the output of {domain.name}")
+    if not domain.has("CFB"):
+        raise KeyError(f"CFB is not in the output of {domain.name}")
+    return np.array(domain.last("CFB", grid_slice))
 
 
 def get_ravg_cc(
@@ -56,7 +54,7 @@ def get_ravg_cc(
 
     ``obs_h5`` is an observation file or a benchmark kit's template. A cell the fire did not burn
     (FIRE_AREA below 0.5) is 9, outside the burn area; a burnt cell takes the class of its canopy
-    fraction burnt (``canopy_fraction_burnt``). A cell of the grid outside every fire grid takes
+    fraction burnt (``crown_fraction_burnt``). A cell of the grid outside every fire grid takes
     the reference's ``_FillValue`` (0, no data). A cell takes the finest fire grid that holds it.
     """
     ref_cc = obs_h5.get(f"{ravg_group_path}/ravg_canopy_cover_loss")
@@ -95,7 +93,7 @@ def get_ravg_cc(
 
         def canopy_cover_loss(domain):
             fire_area = np.array(domain.last("FIRE_AREA", grid_slice))
-            cfb = canopy_fraction_burnt(domain, grid_slice)
+            cfb = crown_fraction_burnt(domain, grid_slice)
             Ny, Nx = fire_area.shape
             return __compute_canopy_cover_loss_from_cfb(Nx, Ny, fire_area, cfb)
 

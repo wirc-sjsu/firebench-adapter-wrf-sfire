@@ -102,16 +102,6 @@ class WrfDomain:
                 return np.asarray(np.ma.getdata(values))
         raise IndexError(f"{self.name} has no output time {index}")
 
-    def maximum(self, variable: str, grid_slice: slice) -> np.ndarray:
-        """The largest value of a field at each cell over every output time."""
-        largest = None
-        for index in range(self.xtime().size):
-            values = self.at(variable, index, grid_slice)
-            largest = values if largest is None else np.maximum(largest, values)
-        if largest is None:
-            raise ValueError(f"{self.name} has no output time")
-        return largest
-
     def series(self, variable: str, time_slice: slice, *point: int) -> np.ndarray:
         """The values of ``variable`` at ``point`` (layer, j, i or j, i) over ``time_slice`` of xtime()."""
         self.xtime()

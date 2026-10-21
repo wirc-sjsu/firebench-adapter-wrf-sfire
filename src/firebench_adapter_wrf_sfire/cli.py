@@ -25,7 +25,12 @@ from firebench_adapter_wrf_sfire._skip import SkippedWarning, skip
 from firebench_adapter_wrf_sfire._wrfout import WrfRun, open_run
 from firebench_adapter_wrf_sfire.frp import DEFAULT_CONVERSION_FACTOR, DEFAULT_GROUP_PATH
 from firebench_adapter_wrf_sfire.perimeters import PERIMETER_EXTRACTION_METHODS
-from firebench_adapter_wrf_sfire.plume import DEFAULT_MAX_TIME_GAP, DEFAULT_TRACER, TRACER_NAME
+from firebench_adapter_wrf_sfire.plume import (
+    DEFAULT_MAX_TIME_GAP,
+    DEFAULT_TRACER,
+    TRACER_NAME,
+    inspect_plume,
+)
 
 DEFAULT_COMPRESSION_LVL = 3
 DEFAULT_FIRE_GRID_BOUND = 25
@@ -131,6 +136,43 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
             err=True,
         )
+
+
+@main.command()
+@click.argument("config_yml", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def inspect(config_yml: Path) -> None:
+    """Check that the run of CONFIG_YML gives what its plume section needs, reading no 3D field.
+
+    Prints the tr17 tracers and the fields of each domain, which domain gives each radar target of
+    the template, how many radar times the run covers, and about how large the output is.
+    """
+    config = _load_config(config_yml)
+    config_dir = config_yml.resolve().parent
+    main_config = _required_mapping(config, "main")
+    reference = _reference_path(main_config, config_dir)
+    wrf_path = _required_path(main_config, "wrf_path", config_dir)
+    section = _optional_mapping(config, "plume")
+    _check_plume_section(section)
+    try:
+        run_files = open_run(wrf_path)
+    except (OSError, ValueError) as exc:
+        raise click.UsageError(f"Cannot read the WRF-SFIRE output {wrf_path}: {exc}") from exc
+    with run_files:
+        ref_time = _optional_str(main_config, "sfire_ref_time")
+        if ref_time is None:
+            try:
+                ref_time = run_files.start_time()
+            except ValueError as exc:
+                raise click.UsageError(f"main.sfire_ref_time is required: {exc}") from exc
+        for line in inspect_plume(
+            reference,
+            run_files,
+            ref_time,
+            tracer=section.get("tracer", DEFAULT_TRACER),
+            domain=section.get("domain"),
+            max_time_gap=float(section.get("max_time_gap", DEFAULT_MAX_TIME_GAP)),
+        ):
+            click.echo(line)
 
 
 def _run_ref_time(run_files: WrfRun, sfire_ref_time: str | None, config: dict[str, Any]) -> str | None:

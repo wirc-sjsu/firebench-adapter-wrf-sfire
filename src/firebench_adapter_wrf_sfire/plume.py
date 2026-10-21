@@ -14,9 +14,12 @@ mass levels, from PH + PHB. A target time between two output times of a domain t
 time: on a section, the samples of both outputs on its nodes (FireBench's ``ColumnSampler``, the
 nearest column then linear in height); over a frame, the tracer and heights of both outputs, whose
 plume cells FireBench counts over every domain at once (``plume_cell_counts``), each cell weighted by
-its area when several domains give the frame. A target time outside a domain's output, or between two
-of its outputs more than ``max_time_gap`` s apart, is NaN where that domain gives the position; a
-frame needs every domain that gives it.
+its area when several domains give the frame, and puts the highest of each column on the radar's map
+grid (``column_tops``, ``tops_on_map``). Over a frame, only the cells the radar can see count: between
+the lowest and the highest beam over their map cell at that time (``beam_band_at``,
+``visible_cells``). A target time outside a domain's output, or between two of its outputs more than
+``max_time_gap`` s apart, is NaN where that domain gives the position; a frame needs every domain that
+gives it. ``inspect_plume`` says what a run gives, reading no 3D field.
 """
 
 from __future__ import annotations
@@ -33,8 +36,12 @@ from firebench.benchmarks.fire_case_radar_model import (
     ColumnSampler,
     FrameTarget,
     SectionTarget,
+    beam_band_at,
+    column_tops,
     plume_cell_counts,
     plume_cell_mask,
+    tops_on_map,
+    visible_cells,
     write_plume_frame,
     write_plume_points,
     write_plume_section,
@@ -337,6 +344,10 @@ class _Writer:  # pylint: disable=too-few-public-methods
             target.site: np.full((len(target.time), len(target.height_bins) - 1), np.nan)
             for target in targets.frames
         }
+        self.tops = {
+            target.site: np.full((len(target.time), len(target.latitude), len(target.longitude)), np.nan)
+            for target in targets.frames
+        }
         self.clouds: list[dict] = []
         self.cloud_times: list[np.datetime64] = []
 
@@ -366,48 +377,92 @@ class _Writer:  # pylint: disable=too-few-public-methods
             positions = np.flatnonzero(target.time == time)
             if positions.size == 0 or any(found[index] is None for index in giving):
                 continue
-            heights, tracer, inside, area, _, _ = _cells(
-                [
-                    (self.readers[index].plan, cube(index), self.readers[index].plan.columns[target.site])
-                    for index in giving
-                ]
-            )
-            # One domain counts whole cells; several weight each cell by its area, in cells of the coarsest.
-            weights = (
-                area / float(np.median(self.readers[giving[-1]].plan.area)) if len(giving) > 1 else None
-            )
             for position in positions:
-                self.counts[target.site][position] = plume_cell_counts(
-                    heights, tracer, inside, target.height_bins, target.threshold, weights=weights
+                cells, columns = self._frame_cells(target, int(position), giving, cube)
+                # One domain counts whole cells; several weight each cell by its area, in coarsest cells.
+                weights = (
+                    cells["area"] / float(np.median(self.readers[giving[-1]].plan.area))
+                    if len(giving) > 1
+                    else None
                 )
-        if points is not None:
+                self.counts[target.site][position] = plume_cell_counts(
+                    cells["heights"],
+                    cells["tracer"],
+                    cells["inside"],
+                    target.height_bins,
+                    target.threshold,
+                    weights=weights,
+                )
+                plume = plume_cell_mask(cells["tracer"], cells["inside"], target.threshold)
+                tops = column_tops(cells["heights"], plume, cells["column"], len(columns["lat"]))
+                owned = columns["owned"]
+                self.tops[target.site][position] = tops_on_map(
+                    columns["lat"][owned],
+                    columns["lon"][owned],
+                    tops[owned],
+                    columns["size"][owned],
+                    target.latitude,
+                    target.longitude,
+                )
+                if points is not None and target is self.targets.frames[0]:
+                    self._frame_cloud(time, cells, columns, plume, points)
+        if points is not None and not self.targets.frames:
             self._cloud(time, found, cube, points)
 
+    def _frame_cells(self, target: FrameTarget, position: int, giving: list[int], cube):
+        """
+        The cells of every domain that gives the frame, flattened into one list: their height, tracer,
+        whether they count (a column the domain gives, inside the radar's beam band at that time), area,
+        and column; and each column's latitude, longitude, size (m), and whether the domain gives it.
+        """
+        cells = {name: [] for name in ("heights", "tracer", "inside", "area", "column")}
+        columns = {name: [] for name in ("lat", "lon", "size", "owned")}
+        offset = 0
+        for index in giving:
+            plan = self.readers[index].plan
+            heights, tracer = cube(index)
+            owned = plan.columns[target.site]
+            lowest, highest = beam_band_at(target, position, plan.lat, plan.lon)
+            inside = owned[None] & visible_cells(heights, lowest[None], highest[None])
+            ids = offset + np.arange(plan.lat.size).reshape(plan.lat.shape)
+            cells["heights"].append(heights.ravel())
+            cells["tracer"].append(tracer.ravel())
+            cells["inside"].append(inside.ravel())
+            cells["area"].append(np.broadcast_to(plan.area, heights.shape).ravel())
+            cells["column"].append(np.broadcast_to(ids, heights.shape).ravel())
+            columns["lat"].append(plan.lat.ravel())
+            columns["lon"].append(plan.lon.ravel())
+            columns["size"].append(np.sqrt(plan.area).ravel())
+            columns["owned"].append(owned.ravel())
+            offset += plan.lat.size
+        return (
+            {name: np.concatenate(items) for name, items in cells.items()},
+            {name: np.concatenate(items) for name, items in columns.items()},
+        )
+
+    def _frame_cloud(self, time, cells: dict, columns: dict, plume: np.ndarray, points: dict) -> None:
+        """The plume cells of figures over the first frame: those the frame's KPIs count."""
+        kept = _thin(np.flatnonzero(plume), int(points.get("max_per_time", DEFAULT_MAX_POINTS)))
+        column = cells["column"][kept]
+        self.clouds.append(
+            {
+                "position_lon": columns["lon"][column],
+                "position_lat": columns["lat"][column],
+                "position_z": cells["heights"][kept],
+                TRACER: cells["tracer"][kept],
+            }
+        )
+        self.cloud_times.append(time)
+
     def _cloud(self, time, found, cube, points: dict) -> None:
-        """The plume cells of figures: over the first frame, or around the sections."""
-        frame = self.targets.frames[0] if self.targets.frames else None
-        giving = [
-            index
-            for index, reader in enumerate(self.readers)
-            if found[index] is not None and (frame is None or frame.site in reader.plan.columns)
-        ]
+        """The plume cells of figures when the case has no frame: around the sections."""
+        giving = [index for index, _ in enumerate(self.readers) if found[index] is not None]
         if not giving:
             return
         heights, tracer, inside, _, lon, lat = _cells(
-            [
-                (
-                    self.readers[index].plan,
-                    cube(index),
-                    (
-                        self.readers[index].plan.columns[frame.site]
-                        if frame is not None
-                        else self.readers[index].plan.own
-                    ),
-                )
-                for index in giving
-            ]
+            [(self.readers[index].plan, cube(index), self.readers[index].plan.own) for index in giving]
         )
-        threshold = frame.threshold if frame is not None else 0.01
+        threshold = 0.01
         cells = _thin(
             np.flatnonzero(plume_cell_mask(tracer, inside, threshold)),
             int(points.get("max_per_time", DEFAULT_MAX_POINTS)),
@@ -450,7 +505,10 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
         raise ValueError("plume.max_time_gap must be above 0 s")
     targets = plume_targets(ref_path)
     if not targets.sections and not targets.frames:
-        raise ValueError("the case has no cross section and no frame for the radar plume")
+        raise ValueError(
+            "the reference holds no radar plume target (cross section or frame): a kit's template made by "
+            "a FireBench before them; download the kit again"
+        )
     run = as_run(wrf_dataset)
     candidates = _candidates(run, tracer, domain)
     plans = _assign(candidates, targets.sections, targets.frames)
@@ -503,7 +561,15 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
         if len(used) > 1:
             frame_attrs["cell_weights"] = f"cell area over the median cell area of {used[-1]}"
         write_plume_frame(
-            new_h5, target, writer.counts[target.site], attrs=frame_attrs, compression_lvl=compression_lvl
+            new_h5,
+            target,
+            writer.counts[target.site],
+            writer.tops[target.site],
+            attrs={
+                **frame_attrs,
+                "visibility": "radar beam band (lowest_beam to highest_beam of the template)",
+            },
+            compression_lvl=compression_lvl,
         )
     if not any(written.values()):
         raise ValueError(
@@ -521,3 +587,96 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
             compression_lvl=compression_lvl,
         )
     return written
+
+
+def _describe_domain(item: WrfDomain, tracer: str) -> list[str]:
+    tracers = [
+        f"{name} {tuple(item.datasets[0][name].dimensions)}"
+        + (f" [{item.datasets[0][name].units}]" if getattr(item.datasets[0][name], "units", "") else "")
+        for name in item.datasets[0].variables
+        if "tr17" in name.lower()
+    ]
+    missing = [name for name in ("XTIME", *ATMOSPHERE) if not item.has(name)]
+    xtime = item.xtime() if item.has("XTIME") else np.empty(0)
+    steps = np.diff(xtime)
+    lines = [
+        f"{item.name}: {len(item.datasets)} file(s); "
+        + (f"tracers {', '.join(tracers)}" if tracers else "no tr17 tracer"),
+        f"  {tracer}: {'yes' if item.has(tracer) else 'NOT IN THE OUTPUT'}; "
+        + (f"missing: {', '.join(missing)}" if missing else "every other field the plume needs is there"),
+    ]
+    if xtime.size:
+        every = f"every {steps.min():g} to {steps.max():g} min" if steps.size else "one output time"
+        lines.append(f"  output {every}, XTIME {xtime[0]:g} to {xtime[-1]:g} min")
+    return lines
+
+
+def _in_run(readers: list[_Run], times: np.ndarray) -> int:
+    """How many of ``times`` every one of ``readers`` brackets, without reading a field."""
+    count = 0
+    for time in times:
+        minutes = float((time - readers[0].origin) / np.timedelta64(60_000, "ms"))
+        if all(bracket(reader.xtime, minutes, reader.max_time_gap) is not None for reader in readers):
+            count += 1
+    return count
+
+
+def inspect_plume(  # pylint: disable=too-many-arguments,too-many-locals
+    ref_path,
+    wrf_dataset: WrfRun | Dataset,
+    ref_time: str,
+    tracer: str = DEFAULT_TRACER,
+    domain: str | None = None,
+    max_time_gap: float = DEFAULT_MAX_TIME_GAP,
+) -> list[str]:
+    """What ``get_plume`` would read and write, as lines of text, without reading any 3D field: the
+    tracers and fields of each domain, which domain gives each target, how many radar times the run
+    covers, and about how large the output is."""
+    run = as_run(wrf_dataset)
+    lines = [line for item in run.domains for line in _describe_domain(item, tracer)]
+    try:
+        targets = plume_targets(ref_path)
+    except ValueError as error:
+        return [*lines, f"Targets: {error}"]
+    if not targets.sections and not targets.frames:
+        return [
+            *lines,
+            "Targets: none. The template was made by a FireBench before the radar plume targets: "
+            "download the kit again.",
+        ]
+    try:
+        candidates = _candidates(run, tracer, domain)
+        plans = _assign(candidates, targets.sections, targets.frames)
+    except (KeyError, ValueError) as error:
+        return [*lines, f"Targets: {str(error).strip(chr(39))}"]
+    origin = _utc(ref_time)
+    size = 0
+    for target in targets.sections:
+        giving = [plan for plan in plans if target.section in plan.nodes]
+        shares = ", ".join(
+            f"{plan.domain.name} {100 * plan.nodes[target.section].size / target.latitude.size:.0f} %"
+            for plan in giving
+        )
+        readers = [_Run(plan, [], tracer, origin, float(max_time_gap)) for plan in giving]
+        # A node takes the time when its own domain gives it: count the times the finest giving domain has.
+        times = _in_run(readers[:1], target.time)
+        lines.append(
+            f"Section {target.section}: {target.latitude.size} nodes ({shares}); "
+            f"{times} of {len(target.time)} radar times inside the run"
+        )
+        size += len(target.time) * target.latitude.size * 4 * 4
+    for target in targets.frames:
+        giving = [plan for plan in plans if target.site in plan.columns]
+        shares = ", ".join(
+            f"{plan.domain.name} {int(plan.columns[target.site].sum())} columns" for plan in giving
+        )
+        readers = [_Run(plan, [], tracer, origin, float(max_time_gap)) for plan in giving]
+        lines.append(
+            f"Frame of {target.site}: {shares}; map {len(target.latitude)} x {len(target.longitude)}; "
+            f"{_in_run(readers, target.time)} of {len(target.time)} radar times inside the run"
+        )
+        size += len(target.time) * (
+            (len(target.height_bins) - 1) * 8 + len(target.latitude) * len(target.longitude) * 4
+        )
+    lines.append(f"Output: about {size / 1e6:.1f} MB before compression, without the points for figures")
+    return lines

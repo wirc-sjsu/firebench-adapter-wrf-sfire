@@ -35,6 +35,13 @@ FINE_SCALE = 10.0
 SECTION_LON = np.full((3, 4), -120.97)
 SECTION_HEIGHT = np.array([[400.0] * 4, [1200.0] * 4, [2000.0] * 4])
 FRAME_BOX = (-120.995, 38.995, -120.955, 39.035)
+# The radar's map grid over the frame: 4 x 4 cells of 0.01 degree, rows from north to south. The radar
+# sees from the ground to 3 km everywhere but in the north-west cell, where it sees 1 to 2 km only.
+MAP_LAT = np.array([39.03, 39.02, 39.01, 39.00])
+MAP_LON = np.array([-120.99, -120.98, -120.97, -120.96])
+LOWEST = np.zeros((1, 4, 4))
+HIGHEST = np.full((1, 4, 4), 3000.0)
+LOWEST[0, 0, 0], HIGHEST[0, 0, 0] = 1000.0, 2000.0
 
 
 def _when(minutes):
@@ -115,6 +122,10 @@ def case(tmp_path):
                 frame=FRAME_BOX,
                 height_bins=np.arange(0.0, 3100.0, 100.0),
                 threshold=0.01,
+                latitude=MAP_LAT,
+                longitude=MAP_LON,
+                lowest_beam=LOWEST,
+                highest_beam=HIGHEST,
             )
         ],
     )
@@ -227,13 +238,28 @@ def test_the_frame_counts_the_plume_cells_of_every_domain_weighted_by_their_area
         assert frame["plume_cells"].attrs["tracer_relative_threshold"] == 0.01
     # The frame holds 4 x 4 columns of the coarse grid, 6 of them inside the fine grid: 10 coarse
     # columns count, and the 3 x 6 fine columns inside the frame, a quarter as large, count a quarter
-    # each. Each column has six levels whose tracer is above a hundredth of the largest.
+    # each. Each column has six levels whose tracer is above a hundredth of the largest, but the
+    # north-west coarse column, where the radar sees only its levels at 1250 and 1750 m.
     columns = 10 + 18 / 4
     assert counts.shape == (1, 30)
-    assert counts.sum() == pytest.approx(columns * 6, rel=0.02)
-    assert counts[0, 2] == pytest.approx(columns, rel=0.02) and counts[0, 7] == pytest.approx(
-        columns, rel=0.02
-    )
+    assert counts.sum() == pytest.approx((columns - 1) * 6 + 2, rel=0.02)
+    assert counts[0, 2] == pytest.approx(columns - 1, rel=0.02)
+    assert counts[0, 12] == pytest.approx(columns, rel=0.02)
+
+
+def test_the_plume_top_map_is_the_highest_plume_cell_the_radar_sees_over_each_cell(case):
+    assert _run(_config(case)).exit_code == 0
+    with h5py.File(case / "output" / "model.h5", "r") as h5:
+        frame = h5[FRAME]
+        tops = frame["plume_top"][()]
+        assert np.allclose(frame["position_lat"][()], MAP_LAT)
+        assert "beam band" in frame.attrs["visibility"]
+        assert "lowest_beam" not in frame
+    # Every column's highest level (2750 m) is plume; in the north-west cell the radar sees up to 2 km.
+    assert tops.shape == (1, 4, 4)
+    expected = np.full((4, 4), 2750.0)
+    expected[0, 0] = 1750.0
+    assert np.allclose(tops[0], expected)
 
 
 def test_one_domain_counts_whole_cells(case):
@@ -241,16 +267,16 @@ def test_one_domain_counts_whole_cells(case):
     with h5py.File(case / "output" / "model.h5", "r") as h5:
         frame = h5[FRAME]
         assert frame.attrs["domain"] == "d01" and "cell_weights" not in frame.attrs
-        assert frame["plume_cells"][()].sum() == 16 * 6
+        assert frame["plume_cells"][()].sum() == 15 * 6 + 2
 
 
 def test_the_points_of_the_plume_are_written_for_figures_unless_left_out(case):
     assert _run(_config(case, points={"every_s": 60, "max_per_time": 10})).exit_code == 0
     with h5py.File(case / "output" / "model.h5", "r") as h5:
         points = h5[f"{GROUP}/points"]
-        # Every 60 s of the target times the run gives (15 and 30 min), over the frame.
-        assert points["count"][()].tolist() == [10, 10]
-        assert len(points["position_z"]) == 20
+        # At the frame's times (15 min), the cells its KPIs count.
+        assert points["count"][()].tolist() == [10]
+        assert len(points["position_z"]) == 10
     result = CliRunner().invoke(main, ["run", "-o", str(_config(case, points=False))])
     assert result.exit_code == 0, result.output
     with h5py.File(case / "output" / "model.h5", "r") as h5:
@@ -282,3 +308,34 @@ def test_a_time_takes_the_outputs_around_it():
     assert bracket(xtime, -1.0, 1800.0) is None
     assert bracket(xtime, 61.0, 1800.0) is None
     assert bracket(xtime, 15.0, 600.0) is None
+
+
+def test_inspect_says_what_the_run_gives_without_reading_a_3d_field(case):
+    result = CliRunner().invoke(main, ["inspect", str(_config(case))])
+    assert result.exit_code == 0, result.output
+    assert (
+        "d02: 1 file(s); tracers tr17_1 ('Time', 'bottom_top', 'south_north', 'west_east') [ug kg-1]"
+        in result.output
+    )
+    assert "tr17_1: yes; every other field the plume needs is there" in result.output
+    assert "output every 30 to 30 min, XTIME 0 to 60 min" in result.output
+    assert (
+        "Section KTST/axis: 12 nodes (d02 50 %, d01 50 %); 2 of 3 radar times inside the run"
+        in result.output
+    )
+    assert (
+        "Frame of KTST: d02 18 columns, d01 10 columns; map 4 x 4; 1 of 1 radar times inside the run"
+        in result.output
+    )
+    missing = CliRunner().invoke(main, ["inspect", str(_config(case, tracer="tr17_5"))])
+    assert "tr17_5: NOT IN THE OUTPUT" in missing.output
+    assert "Targets: tr17_5 is not in the output; the run has tr17_1, tr17_2, tr17_3" in missing.output
+
+
+def test_a_template_without_targets_says_to_download_the_kit_again(case):
+    with h5py.File(case / "template.h5", "a") as h5:
+        del h5[f"{GROUP}/sections"]
+        del h5[f"{GROUP}/frame"]
+    result = _run(_config(case))
+    assert result.exit_code == 0
+    assert "download the kit again" in result.output

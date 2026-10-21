@@ -82,6 +82,20 @@ was made for another version of the case: download the kit again.
 
 ## 4. Run the adapter
 
+First check, on the machine that holds the run, that it gives what the case needs:
+
+```bash
+fb-sfire inspect adapters/wrf-sfire.yaml
+```
+
+It reads no 3D field. It prints, for each domain, its `tr17` tracers with their dimensions and units,
+whether the chosen tracer and the other fields of the `plume` section are there, and its output
+interval; then which domain gives each cross section and frame of the case, how many radar times the
+run covers, and about how large the output will be. A template without radar targets was made by an
+older FireBench: download the kit again.
+
+Then run it:
+
 ```bash
 fb-sfire run adapters/wrf-sfire.yaml
 ```
@@ -113,8 +127,11 @@ an observation file as reference, give it as `frp.frame: [west, south, east, nor
 The `plume` section writes the run's plume where and when the radar saw it, for FireBench's
 `radar_plume` family: one of WRF-SFIRE's fire tracers, `tr17_1` to `tr17_8` (`plume.tracer`, `tr17_1`
 by default), and the wind, on the nodes of each radar cross section of the case at the start of each
-radar volume, and, for the radars of `echo_top`, the count of the model's plume cells over the radar's
-frame in bins of height. The template gives these targets. Every domain that holds the tracer gives
+radar volume, and, for the radars of `echo_top`, the model's plume over the radar's frame: the count
+of its plume cells in bins of height, and its plume top on the radar's map grid (0.01 degree), the
+highest plume cell of the columns under each map cell. Over a frame, only the cells the radar can see
+count: between the lowest and the highest beam over their map cell at that radar time, which the
+template gives. The template gives these targets. Every domain that holds the tracer gives
 them, so the plume is followed past the nests: each position (a node of a section, a column of a
 frame) comes from the finest domain that holds the tracer and covers it, and each domain is read cut
 to the cells around the positions it gives. Over a frame given by several domains, each cell counts

@@ -353,7 +353,7 @@ def test_inspect_says_what_the_run_gives_without_reading_a_3d_field(case):
     )
     assert "tr17_1: yes; every other field the plume needs is there" in result.output
     assert (
-        "Tracer tr17_1 in ug kg-1: times 1 to ug/kg, then times the dry-air density, to ug/m^3"
+        "Tracer tr17_1 in ug kg-1 (the output): times 1 to ug/kg, then times the dry-air density, to ug/m^3"
         in result.output
     )
     assert "Plume threshold of the case: 0.3 ug/m^3" in result.output
@@ -400,25 +400,41 @@ def test_a_tracer_is_a_mass_per_kg_of_dry_air():
             mixing_ratio_factor(units)
 
 
-def test_a_tracer_without_units_is_skipped_unless_the_config_gives_them(case):
+def test_a_tracer_without_units_is_in_ug_per_kg_unless_the_config_says_otherwise(case):
     run = case / "run"
     for item in run.iterdir():
         item.unlink()
     _write_run(run, units=None)
     result = _run(_config(case))
     assert result.exit_code == 0, result.output
-    assert "not a mass per kg of dry air" in result.output
     with h5py.File(case / "output" / "model.h5", "r") as h5:
-        assert GROUP not in h5
-    result = CliRunner().invoke(main, ["run", "-o", str(_config(case, tracer_units="ug kg-1"))])
+        assert h5[SECTION].attrs["source_units"] == "ug kg-1"
+        assert np.allclose(
+            h5[SECTION]["passive_tracer"][1], _domains(1.0 + SECTION_HEIGHT / 1000.0), atol=1e-4
+        )
+    inspected = CliRunner().invoke(main, ["inspect", str(_config(case))])
+    assert "Tracer tr17_1 in ug kg-1 (WRF-SFIRE's, the output states none)" in inspected.output
+    result = CliRunner().invoke(main, ["run", "-o", str(_config(case, tracer_units="ng kg-1"))])
     assert result.exit_code == 0, result.output
     with h5py.File(case / "output" / "model.h5", "r") as h5:
         assert np.allclose(
-            h5[SECTION]["passive_tracer"][1], _domains(1.0 + SECTION_HEIGHT / 1000.0), atol=1e-4
+            h5[SECTION]["passive_tracer"][1], 1e-3 * _domains(1.0 + SECTION_HEIGHT / 1000.0), atol=1e-6
         )
     refused = _run(_config(case, tracer_units="ug m-3"))
     assert refused.exit_code == 2
     assert "plume.tracer_units" in refused.output
+
+
+def test_a_tracer_stated_in_no_mass_per_mass_is_skipped(case):
+    run = case / "run"
+    for item in run.iterdir():
+        item.unlink()
+    _write_run(run, units="1")
+    result = _run(_config(case))
+    assert result.exit_code == 0, result.output
+    assert "not a mass per kg of dry air" in result.output
+    with h5py.File(case / "output" / "model.h5", "r") as h5:
+        assert GROUP not in h5
 
 
 def test_a_run_without_qvapor_skips_the_plume(case):

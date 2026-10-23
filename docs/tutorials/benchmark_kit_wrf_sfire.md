@@ -66,7 +66,7 @@ frp:
 plume:
   enabled: true
   tracer: tr17_1                                      # the fire tracer compared with the radar
-  # tracer_units: ug kg-1                             # only when the output's units are wrong or missing
+  # tracer_units: ug kg-1                             # the default when the output states none
   max_time_gap: 1800
   points: {max_per_time: 20000, every_s: 900}
 ```
@@ -149,9 +149,10 @@ case's threshold (`tracer_threshold` of FireBench's `fire_case.toml`, in ug/m^3)
 are a mass per kg of dry air (ug kg-1), so the adapter multiplies each cell by the density of its dry
 air, the inverse of WRF's `ALT`: `p / (R_d T (1 + (R_v / R_d) qv))`, with the pressure `P` + `PB`, the
 temperature from the potential temperature `T` + 300 K, and the vapour mixing ratio `QVAPOR`, at each
-output time before the interpolation in time. The units come from the tracer's `units` attribute;
-`plume.tracer_units` replaces them when they are wrong or missing, and a tracer whose units are no
-mass per mass of air is refused, since it has no concentration to compare.
+output time before the interpolation in time. WRF-SFIRE's netCDF output states no units for its
+tracers, so the adapter takes `ug kg-1`; a `units` attribute on the tracer is used when there is one,
+`plume.tracer_units` replaces both, and units that are no mass per mass of air are refused, since the
+tracer then has no concentration to compare.
 
 ### What the simulation cannot give
 

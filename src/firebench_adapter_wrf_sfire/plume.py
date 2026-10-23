@@ -60,6 +60,8 @@ from .frp import cell_area
 
 TRACER_NAME = re.compile(r"^tr17_[1-8]$")
 DEFAULT_TRACER = "tr17_1"
+# The units of WRF-SFIRE's fire tracers, which its netCDF output does not state.
+DEFAULT_TRACER_UNITS = "ug kg-1"
 DEFAULT_MAX_TIME_GAP = 1800.0
 DEFAULT_POINTS_EVERY = 900.0
 DEFAULT_MAX_POINTS = 20_000
@@ -253,7 +255,7 @@ def mixing_ratio_factor(units: str) -> float:
     if text in NO_UNITS or not quantity.dimensionless:
         raise ValueError(
             f"the tracer's units {units!r} are not a mass per kg of dry air (such as ug kg-1); set "
-            "plume.tracer_units when the output's are wrong or missing"
+            "plume.tracer_units when the output's are wrong"
         )
     return float(quantity.to("ug/kg").magnitude)
 
@@ -574,7 +576,8 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
     ``points`` (``max_per_time``, ``every_s``) also writes the model's plume cells for figures, over the
     first frame (or around the sections), every ``every_s`` s; None leaves them out. ``ref_time`` is
     the time XTIME counts from. The tracer is written in ug/m^3 (``TRACER_CONVERSION``) from its units
-    in the output, or ``tracer_units`` when given, which must be a mass per kg of dry air.
+    in the output, or ``tracer_units`` when given, which must be a mass per kg of dry air; an output
+    that states none is in ``DEFAULT_TRACER_UNITS``.
     """
     if not TRACER_NAME.fullmatch(tracer):
         raise ValueError(f"plume.tracer must be one of tr17_1 to tr17_8, not {tracer!r}")
@@ -588,7 +591,7 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
         )
     run = as_run(wrf_dataset)
     candidates = _candidates(run, tracer, domain)
-    units = _tracer_units(candidates, tracer, tracer_units)
+    units, _ = _tracer_units(candidates, tracer, tracer_units)
     factor = mixing_ratio_factor(units)
     plans = _assign(candidates, targets.sections, targets.frames)
     for plan in plans:
@@ -669,12 +672,16 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
     return written
 
 
-def _tracer_units(candidates: list[WrfDomain], tracer: str, given: str | None) -> str:
-    """The units of the tracer: ``given``, else those of the first domain that holds it."""
+def _tracer_units(candidates: list[WrfDomain], tracer: str, given: str | None) -> tuple[str, str]:
+    """The units of the tracer and where they come from: ``given``, else those of the first domain that
+    holds it, else ``DEFAULT_TRACER_UNITS`` when the output states none."""
     if given is not None:
-        return given
+        return given, "plume.tracer_units"
     holder = next(item for item in candidates if item.has(tracer))
-    return str(getattr(holder.variable(tracer), "units", "")).strip()
+    stated = str(getattr(holder.variable(tracer), "units", "")).strip()
+    if stated:
+        return stated, "the output"
+    return DEFAULT_TRACER_UNITS, "WRF-SFIRE's, the output states none"
 
 
 def _describe_domain(item: WrfDomain, tracer: str) -> list[str]:
@@ -738,12 +745,12 @@ def inspect_plume(  # pylint: disable=too-many-arguments,too-many-locals
         plans = _assign(candidates, targets.sections, targets.frames)
     except (KeyError, ValueError) as error:
         return [*lines, f"Targets: {str(error).strip(chr(39))}"]
-    units = _tracer_units(candidates, tracer, tracer_units)
+    units, origin = _tracer_units(candidates, tracer, tracer_units)
     try:
         factor = mixing_ratio_factor(units)
         lines.append(
-            f"Tracer {tracer} in {units}: times {factor:g} to ug/kg, then times the dry-air density, "
-            "to ug/m^3"
+            f"Tracer {tracer} in {units} ({origin}): times {factor:g} to ug/kg, then times the dry-air "
+            "density, to ug/m^3"
         )
     except ValueError as error:
         lines.append(f"Tracer {tracer}: {error}")

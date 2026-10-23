@@ -66,6 +66,7 @@ frp:
 plume:
   enabled: true
   tracer: tr17_1                                      # the fire tracer compared with the radar
+  # tracer_units: ug kg-1                             # only when the output's units are wrong or missing
   max_time_gap: 1800
   points: {max_per_time: 20000, every_s: 900}
 ```
@@ -90,7 +91,8 @@ fb-sfire inspect adapters/wrf-sfire.yaml
 
 It reads no 3D field. It prints, for each domain, its `tr17` tracers with their dimensions and units,
 whether the chosen tracer and the other fields of the `plume` section are there, and its output
-interval; then which domain gives each cross section and frame of the case, how many radar times the
+interval; then the tracer's units and how they become ug/m^3, the case's plume threshold, which domain
+gives each cross section and frame of the case, how many radar times the
 run covers, and about how large the output will be. A template without radar targets was made by an
 older FireBench: download the kit again.
 
@@ -142,8 +144,14 @@ between two output times takes both, linearly in time; a time outside the run, o
 more than `max_time_gap` seconds apart, stays NaN, and FireBench leaves that volume out. The output
 holds no 3D field: the run stays where it ran. `plume.points` also keeps up to `max_per_time` plume
 cells every `every_s` seconds for the site's 3D figures (`points: false` leaves them out); they are
-never scored. The tracer's scale does not matter: FireBench compares where it reaches a share of its
-largest value.
+never scored. FireBench's model plume is where the tracer, as a mass concentration, reaches the
+case's threshold (`tracer_threshold` of FireBench's `fire_case.toml`, in ug/m^3). WRF-SFIRE's tracers
+are a mass per kg of dry air (ug kg-1), so the adapter multiplies each cell by the density of its dry
+air, the inverse of WRF's `ALT`: `p / (R_d T (1 + (R_v / R_d) qv))`, with the pressure `P` + `PB`, the
+temperature from the potential temperature `T` + 300 K, and the vapour mixing ratio `QVAPOR`, at each
+output time before the interpolation in time. The units come from the tracer's `units` attribute;
+`plume.tracer_units` replaces them when they are wrong or missing, and a tracer whose units are no
+mass per mass of air is refused, since it has no concentration to compare.
 
 ### What the simulation cannot give
 
@@ -173,7 +181,7 @@ of d02`). To score every family, keep these variables in the output:
 | `building_damage` | `FIRE_AREA` |
 | `ravg_cc` | `FIRE_AREA`, `CFB` (the last output file is enough) |
 | `frp` | `FGRNHFX` and `FCANHFX` at every output time |
-| `plume` | the tracer (`tr17_1` … `tr17_8`), `PH`, `PHB`, `U`, `V`, `W`, `COSALPHA`, `SINALPHA` at every output time around the radar's volumes |
+| `plume` | the tracer (`tr17_1` … `tr17_8`), `PH`, `PHB`, `P`, `PB`, `T`, `QVAPOR`, `U`, `V`, `W`, `COSALPHA`, `SINALPHA` at every output time around the radar's volumes |
 | `weather` | `T2`, `Q2`, `PSFC`, `U10`, `V10`, `COSALPHA`, `SINALPHA`, `WZ0` (fire domain) or `ZNT`, `FMC_GC` |
 
 `FMC_GC` may hold every fuel class (`weather.i_fmc_10h` picks the 10-hour class, 1 by default) or the

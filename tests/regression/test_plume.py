@@ -16,7 +16,7 @@ from firebench.standardize import new_std_file
 from netCDF4 import Dataset
 
 from firebench_adapter_wrf_sfire.cli import main
-from firebench_adapter_wrf_sfire.plume import bracket
+from firebench_adapter_wrf_sfire.plume import bracket, dry_air_density, mixing_ratio_factor
 
 GROUP = "/spatial_3d/plume"
 SECTION = f"{GROUP}/sections/KTST/axis"
@@ -42,15 +42,31 @@ MAP_LON = np.array([-120.99, -120.98, -120.97, -120.96])
 LOWEST = np.zeros((1, 4, 4))
 HIGHEST = np.full((1, 4, 4), 3000.0)
 LOWEST[0, 0, 0], HIGHEST[0, 0, 0] = 1000.0, 2000.0
+# Every cell at 1000 hPa and 300 K with dry air: its density is p / (R_d T).
+PRESSURE = 100000.0
+RHO = PRESSURE / (287.0 * 300.0)
+# The plume threshold of the template, in ug/m^3: below every cell's tracer at 15 min.
+THRESHOLD = 0.3
 
 
 def _when(minutes):
     return np.datetime64("2026-01-01T00:00", "ms") + np.array(minutes, dtype="timedelta64[m]")
 
 
-def _write_wrfout(path, lat0, lon0, n, step, tracers=("tr17_1", "tr17_2", "tr17_3"), scale=1.0):
-    """A domain whose tracer tr17_k is scale k (t + z / 1000), t the output index, with a wind of 10 m/s
-    along the grid's x axis turned 30 degrees, and w the number of the level."""
+def _write_wrfout(  # pylint: disable=too-many-arguments
+    path,
+    lat0,
+    lon0,
+    n,
+    step,
+    tracers=("tr17_1", "tr17_2", "tr17_3"),
+    scale=1.0,
+    units="ug kg-1",
+    vapour=True,
+):
+    """A domain whose tracer tr17_k is scale k (t + z / 1000) in ``units``, t the output index, with a
+    wind of 10 m/s along the grid's x axis turned 30 degrees, w the number of the level, and dry air
+    at 1000 hPa and 300 K (no QVAPOR at all unless ``vapour``)."""
     lat = lat0 + step * np.arange(n)[:, None] * np.ones((1, n))
     lon = lon0 + step * np.arange(n)[None, :] * np.ones((n, 1))
     n_z = len(Z_STAG) - 1
@@ -85,20 +101,31 @@ def _write_wrfout(path, lat0, lon0, n, step, tracers=("tr17_1", "tr17_2", "tr17_
         )
         wrf.createVariable("U", "f8", ("Time", "bottom_top", "south_north", "west_east_stag"))[:] = 10.0
         wrf.createVariable("V", "f8", ("Time", "bottom_top", "south_north_stag", "west_east"))[:] = 0.0
+        mass = ("Time", "bottom_top", "south_north", "west_east")
+        names = ("PB", "P", "T", "QVAPOR") if vapour else ("PB", "P", "T")
+        for name, value in zip(names, (PRESSURE, 0.0, 0.0, 0.0)):
+            wrf.createVariable(name, "f8", mass)[:] = value
         heights = 0.5 * (Z_STAG[:-1] + Z_STAG[1:])
         for number, name in enumerate(tracers, start=1):
             values = scale * number * (np.arange(len(XTIME))[:, None] + heights[None, :] / 1000.0)
             variable = wrf.createVariable(name, "f4", ("Time", "bottom_top", "south_north", "west_east"))
             variable[:] = np.broadcast_to(values[:, :, None, None], (len(XTIME), n_z, n, n))
-            variable.units = "ug kg-1"
+            if units is not None:
+                variable.units = units
+
+
+def _write_run(run, **options):
+    _write_wrfout(run / "wrfout_d01_2026-01-01_00:00:00", 38.99, -121.01, 8, 0.01, **options)
+    _write_wrfout(
+        run / "wrfout_d02_2026-01-01_00:00:00", 39.02, -120.98, 8, 0.005, scale=FINE_SCALE, **options
+    )
 
 
 @pytest.fixture
 def case(tmp_path):
     run = tmp_path / "run"
     run.mkdir()
-    _write_wrfout(run / "wrfout_d01_2026-01-01_00:00:00", 38.99, -121.01, 8, 0.01)
-    _write_wrfout(run / "wrfout_d02_2026-01-01_00:00:00", 39.02, -120.98, 8, 0.005, scale=FINE_SCALE)
+    _write_run(run)
     template = tmp_path / "template.h5"
     targets = PlumeTargets(
         model_group=GROUP,
@@ -121,7 +148,7 @@ def case(tmp_path):
                 time_origin=ORIGIN,
                 frame=FRAME_BOX,
                 height_bins=np.arange(0.0, 3100.0, 100.0),
-                threshold=0.01,
+                threshold=THRESHOLD,
                 latitude=MAP_LAT,
                 longitude=MAP_LON,
                 lowest_beam=LOWEST,
@@ -171,8 +198,9 @@ def _run(config_path):
 
 
 def _domains(values):
-    """The value of each node from the domain that gives it: the fine one where it covers the node."""
-    return np.where(FINE, FINE_SCALE * values, values)
+    """The concentration of each node from the domain that gives it: the fine one where it covers the
+    node, the tracer times the dry-air density."""
+    return RHO * np.where(FINE, FINE_SCALE * values, values)
 
 
 def test_the_tracer_and_the_wind_are_sampled_on_the_section_between_two_outputs(case):
@@ -183,7 +211,9 @@ def test_the_tracer_and_the_wind_are_sampled_on_the_section_between_two_outputs(
         group = h5[SECTION]
         assert group.attrs["source_variable"] == "tr17_1"
         assert group.attrs["domain"] == "d02, d01"
-        assert group["passive_tracer"].attrs["units"] == "ug kg-1"
+        assert group["passive_tracer"].attrs["units"] == "ug/m^3"
+        assert group.attrs["source_units"] == "ug kg-1"
+        assert "dry-air density" in group.attrs["tracer_conversion"]
         tracer = group["passive_tracer"][()]
         # 15 min: halfway between outputs 0 and 1; 30 min: output 1; 90 min: after the run. Each node
         # comes from the finest domain that covers it.
@@ -235,11 +265,12 @@ def test_the_frame_counts_the_plume_cells_of_every_domain_weighted_by_their_area
         assert frame.attrs["domain"] == "d02, d01"
         assert "cell area" in frame.attrs["cell_weights"]
         counts = frame["plume_cells"][()]
-        assert frame["plume_cells"].attrs["tracer_relative_threshold"] == 0.01
+        assert frame["plume_cells"].attrs["tracer_threshold"] == THRESHOLD
+        assert frame["plume_cells"].attrs["tracer_threshold_units"] == "ug/m^3"
     # The frame holds 4 x 4 columns of the coarse grid, 6 of them inside the fine grid: 10 coarse
     # columns count, and the 3 x 6 fine columns inside the frame, a quarter as large, count a quarter
-    # each. Each column has six levels whose tracer is above a hundredth of the largest, but the
-    # north-west coarse column, where the radar sees only its levels at 1250 and 1750 m.
+    # each. Each column has six levels whose concentration is above the threshold, but the north-west
+    # coarse column, where the radar sees only its levels at 1250 and 1750 m.
     columns = 10 + 18 / 4
     assert counts.shape == (1, 30)
     assert counts.sum() == pytest.approx((columns - 1) * 6 + 2, rel=0.02)
@@ -287,7 +318,9 @@ def test_a_named_domain_takes_every_target(case):
     assert _run(_config(case, domain="d01")).exit_code == 0
     with h5py.File(case / "output" / "model.h5", "r") as h5:
         assert h5[SECTION].attrs["domain"] == "d01"
-        assert np.allclose(h5[SECTION]["passive_tracer"][1], 1.0 + SECTION_HEIGHT / 1000.0, atol=1e-5)
+        assert np.allclose(
+            h5[SECTION]["passive_tracer"][1], RHO * (1.0 + SECTION_HEIGHT / 1000.0), atol=1e-5
+        )
 
 
 def test_firebench_reads_what_the_adapter_wrote(case):
@@ -298,7 +331,8 @@ def test_firebench_reads_what_the_adapter_wrote(case):
         section = ModelSection(h5, GROUP, "KTST/axis", SECTION_LAT.shape)
         assert section.nearest(_when([30])[0], 300) == 1
         times, edges, counts, threshold = model_frame(h5, GROUP, "KTST")
-        assert times.tolist() == _when([15]).tolist() and threshold == 0.01 and len(edges) == 31
+        assert times.tolist() == _when([15]).tolist() and threshold == THRESHOLD and len(edges) == 31
+        assert section.tracer_problem is None
 
 
 def test_a_time_takes_the_outputs_around_it():
@@ -318,6 +352,11 @@ def test_inspect_says_what_the_run_gives_without_reading_a_3d_field(case):
         in result.output
     )
     assert "tr17_1: yes; every other field the plume needs is there" in result.output
+    assert (
+        "Tracer tr17_1 in ug kg-1: times 1 to ug/kg, then times the dry-air density, to ug/m^3"
+        in result.output
+    )
+    assert "Plume threshold of the case: 0.3 ug/m^3" in result.output
     assert "output every 30 to 30 min, XTIME 0 to 60 min" in result.output
     assert (
         "Section KTST/axis: 12 nodes (d02 50 %, d01 50 %); 2 of 3 radar times inside the run"
@@ -339,3 +378,54 @@ def test_a_template_without_targets_says_to_download_the_kit_again(case):
     result = _run(_config(case))
     assert result.exit_code == 0
     assert "download the kit again" in result.output
+
+
+def test_the_dry_air_density_is_the_inverse_of_wrf_s_alt():
+    pressure, theta, vapour = np.array([85000.0, 60000.0]), np.array([5.0, 20.0]), np.array([0.01, 0.002])
+    # WRF's ALT with the moist potential temperature: (R_d / p0) theta_m (p / p0)^(-c_v / c_p).
+    r_d, r_v, c_p = 287.0, 461.6, 3.5 * 287.0
+    theta_m = (theta + 300.0) * (1.0 + r_v / r_d * vapour)
+    alt = r_d / 1e5 * theta_m * (pressure / 1e5) ** (-(c_p - r_d) / c_p)
+    assert np.allclose(dry_air_density(pressure, theta, vapour), 1.0 / alt)
+    assert dry_air_density(PRESSURE, 0.0, 0.0) == pytest.approx(RHO)
+
+
+def test_a_tracer_is_a_mass_per_kg_of_dry_air():
+    assert mixing_ratio_factor("ug kg-1") == pytest.approx(1.0)
+    assert mixing_ratio_factor("ug/kg") == pytest.approx(1.0)
+    assert mixing_ratio_factor("g kg-1") == pytest.approx(1e6)
+    assert mixing_ratio_factor("kg kg-1") == pytest.approx(1e9)
+    for units in ("", "1", "ug m-3", "ppmv", "ug/kg-dryair"):
+        with pytest.raises(ValueError):
+            mixing_ratio_factor(units)
+
+
+def test_a_tracer_without_units_is_skipped_unless_the_config_gives_them(case):
+    run = case / "run"
+    for item in run.iterdir():
+        item.unlink()
+    _write_run(run, units=None)
+    result = _run(_config(case))
+    assert result.exit_code == 0, result.output
+    assert "not a mass per kg of dry air" in result.output
+    with h5py.File(case / "output" / "model.h5", "r") as h5:
+        assert GROUP not in h5
+    result = CliRunner().invoke(main, ["run", "-o", str(_config(case, tracer_units="ug kg-1"))])
+    assert result.exit_code == 0, result.output
+    with h5py.File(case / "output" / "model.h5", "r") as h5:
+        assert np.allclose(
+            h5[SECTION]["passive_tracer"][1], _domains(1.0 + SECTION_HEIGHT / 1000.0), atol=1e-4
+        )
+    refused = _run(_config(case, tracer_units="ug m-3"))
+    assert refused.exit_code == 2
+    assert "plume.tracer_units" in refused.output
+
+
+def test_a_run_without_qvapor_skips_the_plume(case):
+    run = case / "run"
+    for item in run.iterdir():
+        item.unlink()
+    _write_run(run, vapour=False)
+    result = _run(_config(case))
+    assert result.exit_code == 0, result.output
+    assert "QVAPOR not in the output" in result.output

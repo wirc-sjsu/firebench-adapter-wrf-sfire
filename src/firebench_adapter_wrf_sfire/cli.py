@@ -30,6 +30,7 @@ from firebench_adapter_wrf_sfire.plume import (
     DEFAULT_TRACER,
     TRACER_NAME,
     inspect_plume,
+    mixing_ratio_factor,
 )
 
 DEFAULT_COMPRESSION_LVL = 3
@@ -171,6 +172,7 @@ def inspect(config_yml: Path) -> None:
             tracer=section.get("tracer", DEFAULT_TRACER),
             domain=section.get("domain"),
             max_time_gap=float(section.get("max_time_gap", DEFAULT_MAX_TIME_GAP)),
+            tracer_units=section.get("tracer_units"),
         ):
             click.echo(line)
 
@@ -573,6 +575,12 @@ def _check_plume_section(section: dict[str, Any]) -> None:
     domain = section.get("domain")
     if domain is not None and (not isinstance(domain, str) or not domain.startswith("d")):
         raise click.UsageError("plume.domain must name a domain, such as d02, or be left out.")
+    units = section.get("tracer_units")
+    if units is not None:
+        try:
+            mixing_ratio_factor(units if isinstance(units, str) else "")
+        except ValueError as exc:
+            raise click.UsageError(f"plume.tracer_units: {exc}") from exc
     points = _plume_points(section)
     if points is not None:
         if not isinstance(points, dict) or set(points) - {"max_per_time", "every_s"}:
@@ -606,6 +614,7 @@ def _run_plume(  # pylint: disable=too-many-arguments
         max_time_gap=float(section.get("max_time_gap", DEFAULT_MAX_TIME_GAP)),
         points=_plume_points(section),
         compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+        tracer_units=section.get("tracer_units"),
     )
     for target, count in written.items():
         click.echo(f"  {target}: {count} time(s)")

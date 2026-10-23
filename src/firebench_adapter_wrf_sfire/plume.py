@@ -10,13 +10,16 @@ Every domain that holds the tracer gives the targets, so the plume is followed p
 position (a node of a section, a column of a frame) takes the finest domain that holds the tracer and
 covers it. Each domain is read cut to the cells around the positions it gives. The wind is destaggered
 to the mass points and turned to east and north with COSALPHA and SINALPHA; heights are those of the
-mass levels, from PH + PHB. A target time between two output times of a domain takes both, linearly in
-time: on a section, the samples of both outputs on its nodes (FireBench's ``ColumnSampler``, the
-nearest column then linear in height); over a frame, the tracer and heights of both outputs, whose
-plume cells FireBench counts over every domain at once (``plume_cell_counts``), each cell weighted by
-its area when several domains give the frame, and puts the highest of each column on the radar's map
-grid (``column_tops``, ``tops_on_map``). Over a frame, only the cells the radar can see count: between
-the lowest and the highest beam over their map cell at that time (``beam_band_at``,
+mass levels, from PH + PHB. The tracer, a mass per kg of dry air (WRF-SFIRE's ``tr17_*`` are in ug/kg),
+is turned into a mass concentration in ug/m^3, the units of FireBench's plume threshold, by the dry-air
+density of each cell (``dry_air_density``: WRF's inverse of ALT, from P + PB, T + 300 K, and QVAPOR)
+before it is interpolated. A target time between two output times of a domain takes both, linearly in
+time: on a section, the samples of both outputs on its nodes (FireBench's ``ColumnSampler``, the nearest
+column then linear in height); over a frame, the tracer and heights of both outputs, whose plume cells
+FireBench counts over every domain at once at the case's threshold (``plume_cell_counts``), each cell
+weighted by its area when several domains give the frame, and puts the highest of each column on the
+radar's map grid (``column_tops``, ``tops_on_map``). Over a frame, only the cells the radar can see
+count: between the lowest and the highest beam over their map cell at that time (``beam_band_at``,
 ``visible_cells``). A target time outside a domain's output, or between two of its outputs more than
 ``max_time_gap`` s apart, is NaN where that domain gives the position; a frame needs every domain that
 gives it. ``inspect_plume`` says what a run gives, reading no 3D field.
@@ -30,6 +33,7 @@ from datetime import datetime, timezone
 
 import h5py
 import numpy as np
+from firebench.benchmarks.fire_case_parameters import CONCENTRATION_UNITS, load_parameters
 from firebench.benchmarks.fire_case_radar_model import (
     FIELDS,
     TRACER,
@@ -47,6 +51,7 @@ from firebench.benchmarks.fire_case_radar_model import (
     write_plume_section,
 )
 from firebench.benchmarks.fire_case_template import plume_targets
+from firebench.tools.units import ureg
 from netCDF4 import Dataset
 from scipy.spatial import cKDTree
 
@@ -59,8 +64,36 @@ DEFAULT_MAX_TIME_GAP = 1800.0
 DEFAULT_POINTS_EVERY = 900.0
 DEFAULT_MAX_POINTS = 20_000
 GRAVITY = 9.81
+# WRF's constants (share/module_model_constants.F): gas constants of dry air and water vapour, heat
+# capacity of dry air at constant pressure, reference pressure, and base potential temperature.
+R_D = 287.0
+R_V = 461.6
+CP = 7.0 * R_D / 2.0
+P0 = 100000.0
+T0 = 300.0
 # What a domain must hold besides the tracer.
-ATMOSPHERE = ("XLAT", "XLONG", "PH", "PHB", "U", "V", "W", "COSALPHA", "SINALPHA")
+ATMOSPHERE = (
+    "XLAT",
+    "XLONG",
+    "PH",
+    "PHB",
+    "P",
+    "PB",
+    "T",
+    "QVAPOR",
+    "U",
+    "V",
+    "W",
+    "COSALPHA",
+    "SINALPHA",
+)
+# Units that give no scale: a tracer in them has no concentration.
+NO_UNITS = ("", "1", "-", "dimensionless")
+TRACER_CONVERSION = (
+    "the tracer (a mass per kg of dry air) times the dry-air density of its cell, "
+    "p / (R_d T (1 + (R_v / R_d) qv)), with p = P + PB, T = (T + 300 K) (p / 1000 hPa)^(R_d / c_p), and "
+    "qv = QVAPOR (WRF's inverse of ALT), at each output time before the interpolation in time"
+)
 # Cells kept around the targets, so a node near the edge of the cut still finds its column.
 MARGIN = 2
 INTERPOLATION = (
@@ -198,10 +231,50 @@ def _cut(plan: _Plan, sections: list[SectionTarget], candidates: list[WrfDomain]
     plan.area = cell_area(plan.lat, plan.lon) if min(plan.lat.shape) >= 2 else np.ones(plan.lat.shape)
 
 
-def read_fields(plan: _Plan, index: int, tracer: str) -> dict[str, np.ndarray]:
-    """Heights (m above mean sea level), the tracer, and the earth-relative wind on the mass points of
-    the cut at output time ``index``, each (bottom_top, rows, columns)."""
+def mixing_ratio_factor(units: str) -> float:
+    """
+    What a tracer in ``units``, a mass per mass of dry air (``ug kg-1``, ``ug/kg``, ``g/kg``), is
+    multiplied by to be in ug/kg.
+
+    Raises
+    ------
+    ValueError
+        If ``units`` are not a mass per mass: a tracer without units, or on any scale, has no
+        concentration to compare with FireBench's threshold.
+    """
+    text = units.strip()
+    # netCDF's exponents (kg-1) as Pint's (kg^-1).
+    pint_text = re.sub(r"(?<=[A-Za-z])(-?\d+)\b", r"^\1", text)
+    try:
+        quantity = ureg.Quantity(1.0, pint_text)
+    # Pint's errors are AttributeError (an unknown unit), TypeError, or ValueError (a syntax).
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(f"the tracer's units {units!r} are not units") from error
+    if text in NO_UNITS or not quantity.dimensionless:
+        raise ValueError(
+            f"the tracer's units {units!r} are not a mass per kg of dry air (such as ug kg-1); set "
+            "plume.tracer_units when the output's are wrong or missing"
+        )
+    return float(quantity.to("ug/kg").magnitude)
+
+
+def dry_air_density(pressure, theta_perturbation, vapour) -> np.ndarray:
+    """The density of dry air, kg/m^3, from WRF's full pressure (Pa), perturbation potential temperature
+    (K, from 300 K), and water vapour mixing ratio (kg/kg): the inverse of WRF's ALT."""
+    temperature = (theta_perturbation + T0) * (pressure / P0) ** (R_D / CP)
+    return pressure / (R_D * temperature * (1.0 + (R_V / R_D) * vapour))
+
+
+def read_fields(plan: _Plan, index: int, tracer: str, factor: float = 1.0) -> dict[str, np.ndarray]:
+    """Heights (m above mean sea level), the tracer in ug/m^3 (the output's values times ``factor``,
+    in ug/kg, times the dry-air density), and the earth-relative wind on the mass points of the cut at
+    output time ``index``, each (bottom_top, rows, columns)."""
     domain, rows, cols = plan.domain, plan.rows, plan.cols
+    density = dry_air_density(
+        domain.volume("P", index, rows, cols) + domain.volume("PB", index, rows, cols),
+        domain.volume("T", index, rows, cols),
+        domain.volume("QVAPOR", index, rows, cols),
+    )
     geopotential = domain.volume("PH", index, rows, cols) + domain.volume("PHB", index, rows, cols)
     u_stag = domain.volume("U", index, rows, slice(cols.start, cols.stop + 1))
     v_stag = domain.volume("V", index, slice(rows.start, rows.stop + 1), cols)
@@ -210,7 +283,7 @@ def read_fields(plan: _Plan, index: int, tracer: str) -> dict[str, np.ndarray]:
     v = 0.5 * (v_stag[:, :-1, :] + v_stag[:, 1:, :])
     return {
         "z": 0.5 * (geopotential[:-1] + geopotential[1:]) / GRAVITY,
-        TRACER: domain.volume(tracer, index, rows, cols).astype(np.float64),
+        TRACER: domain.volume(tracer, index, rows, cols).astype(np.float64) * factor * density,
         "wind_u": u * plan.cos - v * plan.sin,
         "wind_v": u * plan.sin + v * plan.cos,
         "wind_w": 0.5 * (w_stag[:-1] + w_stag[1:]),
@@ -256,9 +329,11 @@ class _Run:  # pylint: disable=too-many-instance-attributes,too-few-public-metho
         tracer: str,
         origin: np.datetime64,
         max_time_gap: float,
+        factor: float = 1.0,
     ):
         self.plan = plan
         self.tracer = tracer
+        self.factor = factor
         self.origin = origin
         self.max_time_gap = max_time_gap
         self.xtime = plan.domain.xtime()
@@ -288,7 +363,7 @@ class _Run:  # pylint: disable=too-many-instance-attributes,too-few-public-metho
                 del self.samples[key]
         for index in (low, high):
             if index not in self.fields:
-                self.fields[index] = read_fields(self.plan, index, self.tracer)
+                self.fields[index] = read_fields(self.plan, index, self.tracer, self.factor)
         return found
 
     def section(self, name: str, found) -> dict[str, np.ndarray]:
@@ -462,7 +537,7 @@ class _Writer:  # pylint: disable=too-few-public-methods
         heights, tracer, inside, _, lon, lat = _cells(
             [(self.readers[index].plan, cube(index), self.readers[index].plan.own) for index in giving]
         )
-        threshold = 0.01
+        threshold = load_parameters().radar_plume.tracer_threshold
         cells = _thin(
             np.flatnonzero(plume_cell_mask(tracer, inside, threshold)),
             int(points.get("max_per_time", DEFAULT_MAX_POINTS)),
@@ -488,6 +563,7 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
     max_time_gap: float = DEFAULT_MAX_TIME_GAP,
     points: dict | None = None,
     compression_lvl: int = 3,
+    tracer_units: str | None = None,
 ) -> dict[str, int]:
     """Write the run's plume at the targets of the case of ``ref_path`` (a benchmark kit's template or
     an observation file), and return the number of times written for each target.
@@ -497,7 +573,8 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
     ``domain`` (``d01``, ...) takes every position from that one alone, NaN where it does not reach.
     ``points`` (``max_per_time``, ``every_s``) also writes the model's plume cells for figures, over the
     first frame (or around the sections), every ``every_s`` s; None leaves them out. ``ref_time`` is
-    the time XTIME counts from.
+    the time XTIME counts from. The tracer is written in ug/m^3 (``TRACER_CONVERSION``) from its units
+    in the output, or ``tracer_units`` when given, which must be a mass per kg of dry air.
     """
     if not TRACER_NAME.fullmatch(tracer):
         raise ValueError(f"plume.tracer must be one of tr17_1 to tr17_8, not {tracer!r}")
@@ -511,12 +588,15 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
         )
     run = as_run(wrf_dataset)
     candidates = _candidates(run, tracer, domain)
+    units = _tracer_units(candidates, tracer, tracer_units)
+    factor = mixing_ratio_factor(units)
     plans = _assign(candidates, targets.sections, targets.frames)
     for plan in plans:
         _cut(plan, targets.sections, candidates)
     origin = _utc(ref_time)
     writer = _Writer(
-        targets, [_Run(plan, targets.sections, tracer, origin, float(max_time_gap)) for plan in plans]
+        targets,
+        [_Run(plan, targets.sections, tracer, origin, float(max_time_gap), factor) for plan in plans],
     )
     times = np.unique(np.concatenate([target.time for target in (*targets.sections, *targets.frames)]))
     wanted = (
@@ -527,10 +607,10 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
     for time in times:
         writer.at(time, points if time in wanted else None)
 
-    holder = next(item for item in candidates if item.has(tracer))
-    units = str(getattr(holder.variable(tracer), "units", "")).strip() or "1"
     attrs = {
         "source_variable": tracer,
+        "source_units": units,
+        "tracer_conversion": TRACER_CONVERSION,
         "time_interpolation": INTERPOLATION,
         "max_time_gap": float(max_time_gap),
         "max_time_gap_units": "s",
@@ -550,7 +630,7 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
             new_h5,
             target,
             values,
-            tracer_units=units,
+            tracer_units=CONCENTRATION_UNITS,
             attrs={**attrs, "domain": used},
             compression_lvl=compression_lvl,
         )
@@ -583,10 +663,18 @@ def get_plume(  # pylint: disable=too-many-arguments,too-many-locals
             np.array(writer.cloud_times, dtype="datetime64[ms]"),
             origin_text,
             writer.clouds,
-            tracer_units=units,
+            tracer_units=CONCENTRATION_UNITS,
             compression_lvl=compression_lvl,
         )
     return written
+
+
+def _tracer_units(candidates: list[WrfDomain], tracer: str, given: str | None) -> str:
+    """The units of the tracer: ``given``, else those of the first domain that holds it."""
+    if given is not None:
+        return given
+    holder = next(item for item in candidates if item.has(tracer))
+    return str(getattr(holder.variable(tracer), "units", "")).strip()
 
 
 def _describe_domain(item: WrfDomain, tracer: str) -> list[str]:
@@ -628,10 +716,11 @@ def inspect_plume(  # pylint: disable=too-many-arguments,too-many-locals
     tracer: str = DEFAULT_TRACER,
     domain: str | None = None,
     max_time_gap: float = DEFAULT_MAX_TIME_GAP,
+    tracer_units: str | None = None,
 ) -> list[str]:
     """What ``get_plume`` would read and write, as lines of text, without reading any 3D field: the
-    tracers and fields of each domain, which domain gives each target, how many radar times the run
-    covers, and about how large the output is."""
+    tracers and fields of each domain, the tracer's units and their conversion to ug/m^3, which domain
+    gives each target, how many radar times the run covers, and about how large the output is."""
     run = as_run(wrf_dataset)
     lines = [line for item in run.domains for line in _describe_domain(item, tracer)]
     try:
@@ -649,6 +738,19 @@ def inspect_plume(  # pylint: disable=too-many-arguments,too-many-locals
         plans = _assign(candidates, targets.sections, targets.frames)
     except (KeyError, ValueError) as error:
         return [*lines, f"Targets: {str(error).strip(chr(39))}"]
+    units = _tracer_units(candidates, tracer, tracer_units)
+    try:
+        factor = mixing_ratio_factor(units)
+        lines.append(
+            f"Tracer {tracer} in {units}: times {factor:g} to ug/kg, then times the dry-air density, "
+            "to ug/m^3"
+        )
+    except ValueError as error:
+        lines.append(f"Tracer {tracer}: {error}")
+    threshold = (
+        targets.frames[0].threshold if targets.frames else load_parameters().radar_plume.tracer_threshold
+    )
+    lines.append(f"Plume threshold of the case: {threshold:g} {CONCENTRATION_UNITS}")
     origin = _utc(ref_time)
     size = 0
     for target in targets.sections:

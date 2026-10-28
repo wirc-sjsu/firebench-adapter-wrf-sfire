@@ -1,3 +1,4 @@
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -127,6 +128,9 @@ def test_cli_runs_cbi_and_weather_on_a_template(kit):
         assert temperature.attrs["sensor_height_units"] == "m"
         assert f"{TIME_SERIES}/station_in/{svn.RELATIVE_HUMIDITY.value}" not in out_h5
         assert f"{TIME_SERIES}/station_out" not in out_h5
+    assert f"Wrote {kit / 'adapters' / 'output' / 'model.zip'}: submit this file" in result.output
+    with zipfile.ZipFile(kit / "adapters" / "output" / "model.zip") as bundle:
+        assert bundle.namelist() == ["model.h5"]
 
 
 def test_cli_refuses_obs_path_and_template_path(kit):
@@ -227,11 +231,11 @@ def test_weather_keeps_what_the_simulation_gives(kit):
         assert f"{TIME_SERIES}/station_after" not in out_h5
 
 
-def test_perimeters_outside_the_simulation_are_skipped(kit, monkeypatch):
+def _fake_perimeters(kit, monkeypatch, paths):
+    """Give the run a TIGN_G and the template a perimeter per name of ``paths``; a KML is one line."""
     with Dataset(kit / "adapters" / "wrfout.nc", "a") as wrf:
         tign = wrf.createVariable("TIGN_G", "f8", ("Time", "south_north", "west_east"))
         tign[:] = np.broadcast_to(np.linspace(0.0, 300.0, 16).reshape(4, 4), (2, 4, 4))
-    paths = {"early": -60, "mid": 60, "late": 600}
     with h5py.File(kit / "adapters" / "template.h5", "a") as h5:
         for name, seconds in paths.items():
             group = h5.create_group(f"/polygons/perimeter_{name}")
@@ -247,6 +251,11 @@ def test_perimeters_outside_the_simulation_are_skipped(kit, monkeypatch):
     monkeypatch.setattr(
         perimeters_module, "_extract_perimeter_geopolygons", lambda *_a, **_k: FakePerimeters()
     )
+
+
+def test_perimeters_outside_the_simulation_are_skipped(kit, monkeypatch):
+    paths = {"early": -60, "mid": 60, "late": 600}
+    _fake_perimeters(kit, monkeypatch, paths)
     config_path = _config(
         kit,
         perimeters={
@@ -267,6 +276,40 @@ def test_perimeters_outside_the_simulation_are_skipped(kit, monkeypatch):
     with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
         assert list(out_h5["polygons"]) == ["perimeter_mid"]
         assert out_h5["polygons/perimeter_mid"].attrs["rel_path"].startswith("kml_model/")
+
+
+def test_the_zip_holds_the_output_and_its_kml_files(kit, monkeypatch):
+    _fake_perimeters(kit, monkeypatch, {"a": 60, "b": 120})
+    config_path = _config(
+        kit, perimeters={"enabled": True, "paths": ["/polygons/perimeter_a", "/polygons/perimeter_b"]}
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    output_dir = kit / "adapters" / "output"
+    with h5py.File(output_dir / "model.h5", "r") as out_h5:
+        rel_paths = [out_h5[f"polygons/perimeter_{name}"].attrs["rel_path"] for name in ("a", "b")]
+    # kml_dir defaults to kml_model beside the output.
+    assert all(rel_path.startswith("kml_model/") for rel_path in rel_paths)
+    with zipfile.ZipFile(output_dir / "model.zip") as bundle:
+        assert sorted(bundle.namelist()) == sorted(["model.h5", *rel_paths])
+        assert bundle.read("model.h5") == (output_dir / "model.h5").read_bytes()
+        for rel_path in rel_paths:
+            assert bundle.read(rel_path) == (output_dir / rel_path).read_bytes()
+    assert not (output_dir / "model.zip.part").exists()
+
+
+def test_a_kml_dir_outside_the_output_folder_stops_before_writing(kit):
+    config_path = _config(
+        kit, perimeters={"enabled": True, "paths": ["/polygons/a"], "kml_dir": "kml_model"}
+    )
+
+    result = _run(config_path)
+
+    assert result.exit_code != 0
+    assert "perimeters.kml_dir must be inside the output's folder" in result.output
+    assert not (kit / "adapters" / "output" / "model.h5").exists()
 
 
 def test_a_section_the_data_cannot_give_is_skipped(kit):

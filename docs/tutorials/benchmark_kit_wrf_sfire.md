@@ -102,8 +102,9 @@ Then run it:
 fb-sfire run adapters/wrf-sfire.yaml
 ```
 
-It writes `output/FBF-0001_WRF-SFIRE.h5` and the perimeters' KML files under `output/kml_model/`.
-An existing output stops the run; `fb-sfire run -o adapters/wrf-sfire.yaml` replaces it and
+It writes `output/FBF-0001_WRF-SFIRE.h5`, the perimeters' KML files under `output/kml_model/`, and
+`output/FBF-0001_WRF-SFIRE.zip`, which holds both and is the file to submit. `perimeters.kml_dir` must
+be inside the output's folder, so the zip can hold the KML files. An existing output stops the run; `fb-sfire run -o adapters/wrf-sfire.yaml` replaces it and
 recomputes the KML files (as `main.overwrite: true`).
 
 The `burn_severity_cbi` section writes RAVG's four-class composite burn index
@@ -191,6 +192,6 @@ the run before anything is written.
 
 ## 5. Submit
 
-Zip the `output/` folder, so the HDF5 file and its `kml_model/` folder are together, and submit the zip
-on the dataset's submit page of the site. FireBench checks it against the observations; you then
+Submit `output/FBF-0001_WRF-SFIRE.zip`, which the adapter wrote, on the dataset's submit page of the
+site. FireBench checks it against the observations; you then
 choose the KPI groups to score.

@@ -56,6 +56,8 @@ fb-sfire run config.yml
 The config contains a `main` section for shared paths and times, plus dedicated sections such as
 `severity`, `building_damage`, `ravg_cc`, `burn_severity_cbi`, `perimeters`, `weather`, `frp`, and `plume`. `main.wrf_path` is the folder
 of the run (every `wrfout_dNN_*` file, each value from the finest domain that holds it) or one file.
+Beside the HDF5 output, `fb-sfire run` writes its zip (`output.h5` gives `output.zip`), the file to
+submit: the HDF5 at its root and the KML files of its perimeters at the paths it gives.
 
 To enter a benchmark case of the FireBench Foundation site (`FBF-` cases), download the case's
 benchmark kit with the WRF-SFIRE adapter chosen, then run `fb-sfire run adapters/wrf-sfire.yaml`; see

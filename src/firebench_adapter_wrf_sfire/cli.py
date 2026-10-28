@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import warnings
+import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import click
@@ -87,11 +88,7 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
     end_dt = _optional_datetime(main_config, "end_dt")
 
     if _section_enabled(config, "perimeters"):
-        extraction_method = _optional_mapping(config, "perimeters").get("extraction_method", "tign_g")
-        if extraction_method not in PERIMETER_EXTRACTION_METHODS:
-            raise click.UsageError(
-                f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
-            )
+        _check_perimeters_section(_optional_mapping(config, "perimeters"), config_dir, output_path)
     _check_band_and_plume(config)
     if _section_enabled(config, "weather"):
         if start_dt is None or end_dt is None:
@@ -107,6 +104,7 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
         raise click.UsageError(f"Cannot read the WRF-SFIRE output {wrf_path}: {exc}") from exc
     with run_files:
         sfire_ref_time = _run_ref_time(run_files, sfire_ref_time, config)
+        _package_path(output_path).unlink(missing_ok=True)
         try:
             new_h5 = fs.new_std_file(str(output_path), authors, overwrite=overwrite)
         except FileExistsError as exc:
@@ -126,12 +124,14 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             compression_lvl,
             overwrite,
         )
+    package_path = _write_package(output_path)
 
     skipped = [item for item in caught if issubclass(item.category, SkippedWarning)]
     for item in caught:
         if not issubclass(item.category, SkippedWarning):
             warnings.showwarning(item.message, item.category, item.filename, item.lineno)
     click.echo(f"Wrote {output_path}")
+    click.echo(f"Wrote {package_path}: submit this file on the site.")
     if skipped:
         click.echo(
             f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
@@ -259,6 +259,41 @@ def _run_sections(  # pylint: disable=too-many-arguments
         finally:
             new_h5.close()
     return caught
+
+
+def _package_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".zip")
+
+
+def _write_package(output_path: Path) -> Path:
+    """Zip the output with the files it references (``rel_path``), at those paths, for a submission."""
+    root = output_path.parent
+    referenced: list[str] = []
+
+    def collect(_name: str, item: h5py.HLObject) -> None:
+        if "rel_path" in item.attrs:
+            referenced.append(str(item.attrs["rel_path"]))
+
+    with h5py.File(output_path, "r") as out_h5:
+        out_h5.visititems(collect)
+    for rel_path in referenced:
+        path = PurePosixPath(rel_path)
+        if path.is_absolute() or ".." in path.parts or not (root / rel_path).is_file():
+            raise click.UsageError(
+                f"Wrote {output_path}, but not its zip: it references {rel_path}, which is not a file "
+                f"inside {root}."
+            )
+    package_path = _package_path(output_path)
+    part_path = package_path.with_name(f"{package_path.name}.part")
+    try:
+        with zipfile.ZipFile(part_path, "w", zipfile.ZIP_DEFLATED) as bundle:
+            bundle.write(output_path, output_path.name)
+            for rel_path in dict.fromkeys(referenced):
+                bundle.write(root / rel_path, rel_path)
+        part_path.replace(package_path)
+    finally:
+        part_path.unlink(missing_ok=True)
+    return package_path
 
 
 def _echo_skipped(caught: list[warnings.WarningMessage], shown: int) -> int:
@@ -670,7 +705,7 @@ def _run_perimeters(
         raise click.UsageError("perimeters.paths must be a non-empty list of group paths.")
 
     click.echo("Process Perimeters")
-    kml_dir = _resolve_path(Path(section.get("kml_dir", DEFAULT_PERIMETER_KML_DIR)), config_dir)
+    kml_dir = _kml_dir(section, config_dir, Path(new_h5.filename))
     get_perimeters_from_t_ign_g(
         new_h5,
         obs_h5,
@@ -683,6 +718,26 @@ def _run_perimeters(
         extraction_method=section.get("extraction_method", "tign_g"),
         smooth_sigma=float(section.get("smooth_sigma", 0)),
     )
+
+
+def _check_perimeters_section(section: dict[str, Any], config_dir: Path, output_path: Path) -> None:
+    if section.get("extraction_method", "tign_g") not in PERIMETER_EXTRACTION_METHODS:
+        raise click.UsageError(
+            f"perimeters.extraction_method must be one of {', '.join(PERIMETER_EXTRACTION_METHODS)}."
+        )
+    kml_dir = _kml_dir(section, config_dir, output_path)
+    if not kml_dir.resolve().is_relative_to(output_path.parent.resolve()):
+        raise click.UsageError(
+            f"perimeters.kml_dir must be inside the output's folder {output_path.parent}, so the zip of "
+            "the output can hold the KML files."
+        )
+
+
+def _kml_dir(section: dict[str, Any], config_dir: Path, output_path: Path) -> Path:
+    """``kml_dir`` against the config's folder; by default, ``kml_model`` beside the output."""
+    if "kml_dir" in section:
+        return _resolve_path(Path(section["kml_dir"]), config_dir)
+    return output_path.parent / DEFAULT_PERIMETER_KML_DIR
 
 
 def _run_weather(

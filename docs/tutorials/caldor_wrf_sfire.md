@@ -98,7 +98,9 @@ The old script flags map directly to section settings:
 
 ## Defaults and Notes
 
-`main.compression_lvl` defaults to `3`, `main.fire_grid_bound` defaults to `25`, and `main.overwrite` defaults to `false`. `perimeters.kml_dir` defaults to `kml_model`, and `perimeters.smooth_sigma` defaults to `0`.
+`main.compression_lvl` defaults to `3`, `main.fire_grid_bound` defaults to `25`, and `main.overwrite` defaults to `false`. `perimeters.kml_dir` defaults to `kml_model` beside the output, must be inside the output's folder, and `perimeters.smooth_sigma` defaults to `0`.
+
+Beside the output, `fb-sfire run` writes its zip, `outputs/SFIRE_Caldor.zip`: the HDF5 file at its root and every file it references (the perimeters' KML files) at the path it gives. The zip is the file to submit.
 
 The perimeter workflow requires the perimeter groups in the observation file to have a `time` attribute. The value of `main.sfire_ref_time` must use the same timezone convention as those perimeter times so that `TIGN_G` is converted to the correct elapsed seconds.
 

@@ -316,6 +316,8 @@ def __process_weather_station(
 
     # get SFIRE data
     grid_slice = fire_grid_slice(fire_grid_bound)
+    # Convert indices found on trimmed coordinates to full-grid field indices.
+    grid_offset = grid_slice.start or 0
     xlat = np.array(wrf_dataset["XLAT"][0, grid_slice, grid_slice])
     xlon = np.array(wrf_dataset["XLONG"][0, grid_slice, grid_slice])
     Ny, Nx = xlat.shape
@@ -353,6 +355,8 @@ def __process_weather_station(
                 min_dlat,
                 min_dlon,
             )
+            i_nearest += grid_offset
+            j_nearest += grid_offset
             sfire_t2_interp = _interp_linear_1d_strict(
                 time_sfire[i_start : i_end + 1],
                 wrf_dataset["T2"][i_start : i_end + 1, j_nearest, i_nearest],
@@ -389,6 +393,8 @@ def __process_weather_station(
                 min_dlat,
                 min_dlon,
             )
+            i_nearest += grid_offset
+            j_nearest += grid_offset
             t2_raw = wrf_dataset["T2"][i_start : i_end + 1, j_nearest, i_nearest]
             q2_raw = wrf_dataset["Q2"][i_start : i_end + 1, j_nearest, i_nearest]
             psfc_raw = wrf_dataset["PSFC"][i_start : i_end + 1, j_nearest, i_nearest]
@@ -430,6 +436,8 @@ def __process_weather_station(
                 min_dlat,
                 min_dlon,
             )
+            i_nearest += grid_offset
+            j_nearest += grid_offset
             u10_raw = wrf_dataset["U10"][i_start : i_end + 1, j_nearest, i_nearest]
             v10_raw = wrf_dataset["V10"][i_start : i_end + 1, j_nearest, i_nearest]
             cosalpha_raw, sinalpha_raw = _get_wind_rotation(
@@ -475,6 +483,8 @@ def __process_weather_station(
             min_dlat,
             min_dlon,
         )
+        i_nearest += grid_offset
+        j_nearest += grid_offset
         if_nearest, jf_nearest = find_nearest_grid_point(
             Nxf,
             Nyf,
@@ -485,6 +495,8 @@ def __process_weather_station(
             min_dlatf,
             min_dlonf,
         )
+        if_nearest += grid_offset
+        jf_nearest += grid_offset
         print("Nearest WS10 with S10 scaling")
         u10_raw = wrf_dataset["U10"][i_start : i_end + 1, j_nearest, i_nearest]
         v10_raw = wrf_dataset["V10"][i_start : i_end + 1, j_nearest, i_nearest]
@@ -529,6 +541,8 @@ def __process_weather_station(
             min_dlat,
             min_dlon,
         )
+        i_nearest += grid_offset
+        j_nearest += grid_offset
         if i_fmc_10h is None:
             fmc10h_raw = wrf_dataset["FMC_GC"][i_start : i_end + 1, j_nearest, i_nearest]
         else:

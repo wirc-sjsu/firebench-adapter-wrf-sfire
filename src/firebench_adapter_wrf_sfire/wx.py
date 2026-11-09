@@ -159,10 +159,13 @@ def _interp_linear_1d_strict(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np
     """
     Linear interpolation with the same settings as your current usage:
     bounds_error=True, fill_value=np.nan, assume_sorted=True.
+
+    Use float64 values so scipy can return an exact sample when the bracket
+    contains one timestamp; its float32 path divides by a zero time interval.
     """
     f = interp1d(
         x,
-        y,
+        np.asarray(y, dtype=np.float64),
         kind="linear",
         bounds_error=True,
         fill_value=np.nan,
@@ -448,12 +451,14 @@ def __process_weather_station(
             )
             u_true = u10_raw * cosalpha_raw - v10_raw * sinalpha_raw
             v_true = u10_raw * sinalpha_raw + v10_raw * cosalpha_raw
-            wind_dir_raw = wind_dir_from_uv(u_true, v_true)
-            sfire_data_interp = _interp_linear_1d_strict(
-                time_sfire[i_start : i_end + 1],
-                wind_dir_raw,
-                time_in_period_sfire,
+            # Interpolate vectors before deriving direction to cross north correctly.
+            u_interp = _interp_linear_1d_strict(
+                time_sfire[i_start : i_end + 1], u_true, time_in_period_sfire
             )
+            v_interp = _interp_linear_1d_strict(
+                time_sfire[i_start : i_end + 1], v_true, time_in_period_sfire
+            )
+            sfire_data_interp = wind_dir_from_uv(u_interp, v_interp)
             var = new_wx.create_dataset(
                 svn.WIND_DIRECTION.value,
                 data=sfire_data_interp,

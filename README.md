@@ -61,7 +61,9 @@ submit: the HDF5 at its root and the KML files of its perimeters at the paths it
 
 To enter a benchmark case of the FireBench Foundation site (`FBF-` cases), download the case's
 benchmark kit with the WRF-SFIRE adapter chosen, then run `fb-sfire run adapters/wrf-sfire.yaml`; see
-`docs/tutorials/benchmark_kit_wrf_sfire.md`.
+`docs/tutorials/benchmark_kit_wrf_sfire.md`. A forecast window's kit has a `window` section in its
+config: the run is then written on its own grid and output times, for a period not yet observed (same
+tutorial, last section).
 
 See the tutorial in the documentation for a complete WRF-SFIRE to FireBench workflow:
 

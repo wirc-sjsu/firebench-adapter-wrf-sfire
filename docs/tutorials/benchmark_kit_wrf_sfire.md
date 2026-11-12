@@ -195,3 +195,41 @@ the run before anything is written.
 Submit `output/FBF-0001_WRF-SFIRE.zip`, which the adapter wrote, on the dataset's submit page of the
 site. FireBench checks it against the observations; you then
 choose the KPI groups to score.
+
+## Run from a forecast window's kit
+
+A forecast window is entered before anything is observed, so its output is not laid out on
+observations. The window kit holds `window.json`, `template.h5` (the window's definition and its
+stations), and `adapters/wrf-sfire.yaml`; change its two `CHANGE_ME` lines, as above:
+
+```yaml
+main:
+  template_path: ../template.h5
+  wrf_path: CHANGE_ME          # folder of the run or one wrfout file
+  output_path: ../output/FW24-1_WRF-SFIRE.h5
+  authors: CHANGE_ME
+window:
+  name: FW24-1
+  definition_sha256: <sha256 of the definition>
+arrival_time:
+  enabled: true
+weather:
+  enabled: true
+```
+
+The `window` section selects this mode. The period comes from the definition in the template (there is
+no `start_dt` or `end_dt`), only `arrival_time` and `weather` can be enabled, and the run is refused
+when `definition_sha256` is not the template's. Nothing is interpolated to observation times, which
+FireBench brings the output to itself:
+
+- `arrival_time` writes `TIGN_G` at the last output time of the run, on the finest fire grid (trimmed
+  by `fire_grid_bound`), under the group the definition names: `fire_arrival_time` in seconds after
+  the start of the run, NaN where the fire had not arrived by that time, with `position_lat`,
+  `position_lon`, and `time`, the run's output times.
+- `weather` writes, for each station of the template, the run's own values at the station on its own
+  output times, from the last at or before the start of the period to the first at or after its end,
+  from the finest domain that covers the period. The rest is as in the case: the same variables,
+  units, and sensor heights.
+
+A run that stops before the end of the period still writes what it has, with a `WARNING`, and
+FireBench's check on the site says what the output cannot enter. Submit `output/FW24-1_WRF-SFIRE.zip`.

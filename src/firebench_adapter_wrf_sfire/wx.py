@@ -108,6 +108,34 @@ def _bracket_indices_inclusive(model_time: np.ndarray, ref_start: float, ref_end
     return i_start, i_end
 
 
+def _model_times_in_period(
+    candidates: list[WrfDomain], offset_start: float, offset_end: float
+) -> tuple[WrfDomain, np.ndarray, bool]:
+    """
+    The output times of the run in a period, from the last at or before its start to the first at or
+    after its end, in seconds after the start, with the domain that gives them and whether they
+    cover the period. The finest domain whose outputs cover the period gives them; otherwise the
+    finest with an output inside it. Raises ValueError when no domain has one.
+    """
+    duration = offset_end - offset_start
+    partial = None
+    for domain in candidates:
+        times = _sfire_time_seconds(domain, offset_start)
+        if not times.size:
+            continue
+        first, last = max(bisect_right(times, 0.0) - 1, 0), min(
+            bisect_left(times, duration), times.size - 1
+        )
+        found = (domain, times[first : last + 1], times[0] <= 0.0 and times[-1] >= duration)
+        if found[2]:
+            return found
+        if partial is None and np.any((times >= 0.0) & (times <= duration)):
+            partial = found
+    if partial is None:
+        raise ValueError("no output time of the run inside the period")
+    return partial
+
+
 def _validate_bracket(
     i_start: int,
     i_end: int,
@@ -292,6 +320,7 @@ def __process_weather_station(
     fire_grid_bound: int,
     compression_lvl: int,
     i_fmc_10h: int | None,
+    model_times: bool = False,
 ):
     STATION_ATTRS_TO_COPY = [
         "position_lat",
@@ -299,12 +328,13 @@ def __process_weather_station(
         "position_lat_units",
         "position_lon_units",
     ]
-    time_in_period, time_origin = _time_in_period_seconds(
-        obs_h5, station_path, period_start_dt, period_end_dt
-    )
-    if len(time_in_period) == 0:
-        print("No data in time period. Skip")
-        return
+    if not model_times:
+        time_in_period, time_origin = _time_in_period_seconds(
+            obs_h5, station_path, period_start_dt, period_end_dt
+        )
+        if len(time_in_period) == 0:
+            print("No data in time period. Skip")
+            return
 
     grid_slice = fire_grid_slice(fire_grid_bound)
     # Indices found on the trimmed grid, read on the full one.
@@ -324,26 +354,39 @@ def __process_weather_station(
     period_start_dt = _as_utc_datetime(period_start_dt)
     period_end_dt = _as_utc_datetime(period_end_dt)
     offset_start = (period_start_dt - sfire_ref_time).total_seconds()
-    offset_station_to_period_start = (time_origin - period_start_dt).total_seconds()
-    time_in_period_sfire = time_in_period + offset_station_to_period_start
 
-    # Keep the observation times the simulation covers: the periods inside them can be scored. The
-    # finest domain that covers one of them gives the station's times.
-    covered = None
-    for domain in candidates:
-        time_sfire = _sfire_time_seconds(domain, offset_start)
-        if time_sfire.size:
-            mask = _mask_between_inclusive(time_in_period_sfire, time_sfire[0], time_sfire[-1])
-            if mask.any():
-                covered = mask
-                break
-    if covered is None:
-        skip(station_path, "no observation time inside the simulation")
-        return
-    if not covered.all():
-        print(f"Simulation covers {covered.sum()} of {covered.size} observation times")
-    time_in_period = time_in_period[covered]
-    time_in_period_sfire = time_in_period_sfire[covered]
+    if model_times:
+        # The station is given on the output times of one domain, not brought to other times.
+        domain, time_in_period_sfire, covers = _model_times_in_period(
+            candidates, offset_start, (period_end_dt - sfire_ref_time).total_seconds()
+        )
+        candidates = [domain]
+        time_in_period, time_origin = time_in_period_sfire, period_start_dt
+        if not covers:
+            skip(
+                f"The part of {station_path} outside the run's output",
+                f"{domain.name} gives output times from {time_in_period[0]:g} s to "
+                f"{time_in_period[-1]:g} s after the start of the period",
+            )
+    else:
+        time_in_period_sfire = time_in_period + (time_origin - period_start_dt).total_seconds()
+        # Keep the observation times the simulation covers: the periods inside them can be scored.
+        # The finest domain that covers one of them gives the station's times.
+        covered = None
+        for domain in candidates:
+            time_sfire = _sfire_time_seconds(domain, offset_start)
+            if time_sfire.size:
+                mask = _mask_between_inclusive(time_in_period_sfire, time_sfire[0], time_sfire[-1])
+                if mask.any():
+                    covered = mask
+                    break
+        if covered is None:
+            skip(station_path, "no observation time inside the simulation")
+            return
+        if not covered.all():
+            print(f"Simulation covers {covered.sum()} of {covered.size} observation times")
+        time_in_period = time_in_period[covered]
+        time_in_period_sfire = time_in_period_sfire[covered]
 
     # Add time to new group
     new_wx = _create_station_group_with_attrs(new_h5, obs_h5, station_path, STATION_ATTRS_TO_COPY)
@@ -398,7 +441,11 @@ def __process_weather_station(
     ):
         var = new_wx.create_dataset(
             variable,
-            data=_interp_linear_1d_strict(model_time, raw, time_in_period_sfire),
+            data=(
+                np.asarray(raw, dtype=np.float64)
+                if model_times
+                else _interp_linear_1d_strict(model_time, raw, time_in_period_sfire)
+            ),
             **hdf5plugin.Zstd(clevel=compression_lvl),
         )
         var.attrs["units"] = units
@@ -539,6 +586,7 @@ def get_weather_stations(
     fire_grid_bound: int = 25,
     compression_lvl: int = 3,
     i_fmc_10h: int | None = 1,
+    model_times: bool = False,
 ):
     """Sample WRF-SFIRE weather variables at observation stations.
 
@@ -553,6 +601,13 @@ def get_weather_stations(
 
     A station or a variable the simulation cannot give is left out with a ``SkippedWarning``, and
     a station keeps only the observation times the simulation covers.
+
+    With ``model_times`` (a forecast window), ``obs_h5`` is the window's template: it gives the
+    stations, their variables and sensor heights, and no observation exists. Each station holds the
+    model's own values at its output times, with no interpolation in time, from the last output at or
+    before ``period_start_dt`` to the first at or after ``period_end_dt``, all from the finest domain
+    that covers the period (``time`` counts seconds from ``period_start_dt``). A run that does not
+    cover the period gives the outputs it has, with a ``SkippedWarning``.
     """
     run = as_run(wrf_dataset)
     if sfire_ref_time is None:
@@ -574,6 +629,7 @@ def get_weather_stations(
                     fire_grid_bound,
                     compression_lvl,
                     i_fmc_10h,
+                    model_times,
                 )
             except SKIPPABLE_ERRORS as exc:
                 if station_path in new_h5:

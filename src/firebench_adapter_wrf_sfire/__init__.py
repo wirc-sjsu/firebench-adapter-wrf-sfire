@@ -3,6 +3,7 @@ from importlib.metadata import version, PackageNotFoundError
 from ._skip import SkippedWarning
 from ._wrfout import WrfRun, open_run
 
+from .arrival_time import get_arrival_time_from_t_ign_g
 from .building_damage import get_building_damage
 from .frp import get_fire_total
 from .perimeters import get_perimeters_from_t_ign_g
@@ -22,6 +23,7 @@ __all__ = [
     "SkippedWarning",
     "WrfRun",
     "open_run",
+    "get_arrival_time_from_t_ign_g",
     "get_building_damage",
     "get_fire_total",
     "get_perimeters_from_t_ign_g",

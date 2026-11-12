@@ -13,6 +13,7 @@ import yaml
 
 import firebench.standardize as fs
 from firebench_adapter_wrf_sfire import (
+    get_arrival_time_from_t_ign_g,
     get_building_damage,
     get_fire_total,
     get_mtbs_severity_surf,
@@ -42,6 +43,8 @@ TEMPLATE_ATTRIBUTE = "firebench_template"
 # A section that fails on the data is skipped, so one config serves simulations that give different
 # parts of a case. An unknown method (NotImplementedError) is a config error and stops the run.
 SECTION_ERRORS = (KeyError, IndexError, ValueError)
+# The sections of a run laid out on a forecast window's template.
+WINDOW_SECTIONS = ("arrival_time", "weather")
 
 
 @click.group()
@@ -63,6 +66,11 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
     config = _load_config(config_yml)
     config_dir = config_yml.resolve().parent
     main_config = _required_mapping(config, "main")
+    if "window" in config:
+        _run_window(config, config_dir, main_config, overwrite_flag)
+        return
+    if _section_enabled(config, "arrival_time"):
+        raise click.UsageError("arrival_time is a section of a forecast window's config (window).")
 
     enabled_sections = _enabled_processing_sections(config)
     if not enabled_sections:
@@ -124,8 +132,12 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             compression_lvl,
             overwrite,
         )
-    package_path = _write_package(output_path)
+    _echo_result(output_path, caught)
 
+
+def _echo_result(output_path: Path, caught: list[warnings.WarningMessage]) -> None:
+    """Write the output's zip and say what was written and what was skipped."""
+    package_path = _write_package(output_path)
     skipped = [item for item in caught if issubclass(item.category, SkippedWarning)]
     for item in caught:
         if not issubclass(item.category, SkippedWarning):
@@ -137,6 +149,165 @@ def run(config_yml: Path, overwrite_flag: bool) -> None:
             f"{len(skipped)} item(s) skipped, listed above as WARNING; the output holds the rest.",
             err=True,
         )
+
+
+def _window_definition(window: dict[str, Any], template_path: Path) -> dict[str, Any]:
+    """The window definition the template holds, refused when the config is for another one."""
+    try:
+        # Imported here so that a FireBench without forecast windows still runs a case config.
+        # pylint: disable=import-outside-toplevel
+        from firebench.benchmarks.fire_case_definition import definition_sha256
+        from firebench.benchmarks.fire_window import check_window, read_window_definition
+
+        # pylint: enable=import-outside-toplevel
+    except ImportError as exc:
+        raise click.UsageError(
+            "A window config needs a FireBench with forecast windows (fire_window): update FireBench."
+        ) from exc
+    try:
+        definition = read_window_definition(template_path)
+    except ValueError as exc:
+        raise click.UsageError(f"{template_path}: {exc}") from exc
+    if definition is None:
+        raise click.UsageError(
+            f"{template_path} is not a forecast window's template (no window definition in it)."
+        )
+    if problems := check_window(definition):
+        raise click.UsageError(f"The window definition of {template_path} has a problem: {problems[0]}")
+    expected = _required_str(window, "definition_sha256")
+    if definition_sha256(definition) != expected:
+        raise click.UsageError(
+            f"This config was made for another version of the window {window.get('name', '')}: "
+            f"{template_path} holds the definition {definition_sha256(definition)}, "
+            f"the config names {expected}."
+        )
+    if window.get("name") not in (None, definition["name"]):
+        raise click.UsageError(
+            f"window.name is {window['name']}, the template's window is {definition['name']}."
+        )
+    return definition
+
+
+def _run_window(  # pylint: disable=too-many-locals
+    config: dict[str, Any], config_dir: Path, main_config: dict[str, Any], overwrite_flag: bool
+) -> None:
+    """Run the arrival_time and weather sections on a forecast window's template.
+
+    The model is not on observations, which do not exist yet: its map is written on its own grid and
+    its station series on its own output times, over the period the template's definition gives.
+    """
+    window = _optional_mapping(config, "window")
+    others = [name for name in _enabled_processing_sections(config) if name not in WINDOW_SECTIONS]
+    if others:
+        raise click.UsageError(
+            f"A window config runs only {' and '.join(WINDOW_SECTIONS)}; {', '.join(others)} "
+            "cannot be enabled."
+        )
+    if not any(_section_enabled(config, name) for name in WINDOW_SECTIONS):
+        raise click.UsageError(f"At least one of {' and '.join(WINDOW_SECTIONS)} must have enabled: true.")
+    if main_config.get("obs_path") is not None:
+        raise click.UsageError("A window config reads main.template_path, not main.obs_path.")
+    template_path = _reference_path(main_config, config_dir)
+    definition = _window_definition(window, template_path)
+    wrf_path = _required_path(main_config, "wrf_path", config_dir)
+    output_path = _required_path(main_config, "output_path", config_dir)
+    authors = _required_str(main_config, "authors")
+    overwrite = overwrite_flag or bool(main_config.get("overwrite", False))
+    if not wrf_path.exists():
+        raise click.UsageError(
+            f"WRF-SFIRE output does not exist: {wrf_path} (give a wrfout file or the folder of the run)"
+        )
+    if output_path.exists() and not overwrite:
+        raise click.UsageError(f"Output file already exists: {output_path}; run with -o to replace it.")
+    try:
+        run_files = open_run(wrf_path)
+    except (OSError, ValueError) as exc:
+        raise click.UsageError(f"Cannot read the WRF-SFIRE output {wrf_path}: {exc}") from exc
+    with run_files:
+        sfire_ref_time = _run_ref_time(run_files, _optional_str(main_config, "sfire_ref_time"), config)
+        _package_path(output_path).unlink(missing_ok=True)
+        try:
+            new_h5 = fs.new_std_file(str(output_path), authors, overwrite=overwrite)
+        except FileExistsError as exc:
+            raise click.UsageError(
+                f"Output file already exists: {output_path}; run with -o to replace it."
+            ) from exc
+        caught = _run_window_sections(
+            config, new_h5, template_path, definition, run_files, sfire_ref_time, main_config
+        )
+    _echo_result(output_path, caught)
+
+
+def _run_window_sections(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    config: dict[str, Any],
+    new_h5: h5py.File,
+    template_path: Path,
+    definition: dict[str, Any],
+    wrf_dataset: WrfRun,
+    sfire_ref_time: str | None,
+    main_config: dict[str, Any],
+) -> list[warnings.WarningMessage]:
+    """Run the enabled sections of a window into ``new_h5``, close it, and return the warnings."""
+    # pylint: disable-next=import-outside-toplevel
+    from firebench.benchmarks.fire_window import ARRIVAL, STATIONS, family, window_period
+
+    period = window_period(definition)
+    fire_grid_bound = int(main_config.get("fire_grid_bound", DEFAULT_FIRE_GRID_BOUND))
+    compression_lvl = int(main_config.get("compression_lvl", DEFAULT_COMPRESSION_LVL))
+
+    def arrival_time() -> None:
+        section = _optional_mapping(config, "arrival_time")
+        entry = family(definition, ARRIVAL)
+        if entry is None:
+            raise ValueError(f"the window does not ask {ARRIVAL}")
+        click.echo("Process Arrival Time")
+        get_arrival_time_from_t_ign_g(
+            new_h5,
+            wrf_dataset,
+            entry["model_group"],
+            sfire_ref_time,
+            fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
+            compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+            period=period,
+        )
+
+    def weather(template_h5: h5py.File) -> None:
+        section = _optional_mapping(config, "weather")
+        if family(definition, STATIONS) is None:
+            raise ValueError(f"the window does not ask {STATIONS}")
+        click.echo("Process WX")
+        get_weather_stations(
+            new_h5,
+            template_h5,
+            wrf_dataset,
+            sfire_ref_time,
+            *period,
+            fire_grid_bound=int(section.get("fire_grid_bound", fire_grid_bound)),
+            compression_lvl=int(section.get("compression_lvl", compression_lvl)),
+            i_fmc_10h=section.get("i_fmc_10h", 1),
+            model_times=True,
+        )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SkippedWarning)
+        try:
+            with h5py.File(template_path, "r") as template_h5:
+                sections = (
+                    ("arrival_time", arrival_time),
+                    ("weather", lambda: weather(template_h5)),
+                )
+                shown = 0
+                for section_name, run_section in sections:
+                    if not _section_enabled(config, section_name):
+                        continue
+                    try:
+                        run_section()
+                    except SECTION_ERRORS as exc:
+                        skip(f"Section {section_name}", exc)
+                    shown = _echo_skipped(caught, shown)
+        finally:
+            new_h5.close()
+    return caught
 
 
 @main.command()

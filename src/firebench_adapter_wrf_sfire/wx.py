@@ -438,13 +438,14 @@ def __process_weather_station(
         raw: np.ndarray,
         units: str,
         prepared_height_m: float | None,
+        interpolate: bool = True,
     ):
         var = new_wx.create_dataset(
             variable,
             data=(
-                np.asarray(raw, dtype=np.float64)
-                if model_times
-                else _interp_linear_1d_strict(model_time, raw, time_in_period_sfire)
+                _interp_linear_1d_strict(model_time, raw, time_in_period_sfire)
+                if interpolate and not model_times
+                else np.asarray(raw, dtype=np.float64)
             ),
             **hdf5plugin.Zstd(clevel=compression_lvl),
         )
@@ -487,6 +488,10 @@ def __process_weather_station(
         cosalpha_raw, sinalpha_raw = _get_wind_rotation(domain, model_slice, j, i)
         u_true = u10_raw * cosalpha_raw - v10_raw * sinalpha_raw
         v_true = u10_raw * sinalpha_raw + v10_raw * cosalpha_raw
+        if not model_times:
+            # Interpolate vectors before deriving direction to cross north correctly.
+            u_true = _interp_linear_1d_strict(model_time, u_true, time_in_period_sfire)
+            v_true = _interp_linear_1d_strict(model_time, v_true, time_in_period_sfire)
         # The log profile that scales the wind speed keeps its direction: the 10 m direction
         # is the direction at the sensor height.
         write(
@@ -495,6 +500,7 @@ def __process_weather_station(
             wind_dir_from_uv(u_true, v_true),
             "degree",
             wd_sensor_height,
+            interpolate=False,
         )
 
     def wind_speed_at_sensor(domain: WrfDomain):

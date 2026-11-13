@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - A weather station whose simulation covers a single observation time, at an output time of the run, gets the model's value there instead of NaN (and scipy's `invalid value encountered in divide`).
 - Python 3.10 and 3.11: reading a run no longer stops with `TypeError: unhashable type: 'slice'`.
+- The wind direction at a station between two output times comes from the wind's components interpolated in time, not from the two directions: across north, 350 and 10 degrees gave 180 instead of 0. A window run, which does not interpolate, is unchanged.
 - Weather stations with `fire_grid_bound` above 0 read the grid cell nearest to them: the nearest point was found on the trimmed grid and its indices read on the full one, `fire_grid_bound` cells away (atmospheric variables and `WZ0`).
 
 ## [0.1-dev2] - 2026-10-13

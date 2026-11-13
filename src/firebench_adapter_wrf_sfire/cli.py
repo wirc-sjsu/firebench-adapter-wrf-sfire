@@ -236,6 +236,39 @@ def _run_window(  # pylint: disable=too-many-locals
             config, new_h5, template_path, definition, run_files, sfire_ref_time, main_config
         )
     _echo_result(output_path, caught)
+    _echo_window_check(definition, output_path)
+
+
+def _window_check_lines(report: dict[str, Any]) -> list[str]:
+    """FireBench's check of a window's output, as lines to print: its words, family by family."""
+    lines = [f"FireBench's check of the output for {report['window']['name']}:"]
+    if not report["accepted"]:
+        return [*lines, f"  {report['reason']}"]
+    for entry in report["families"]:
+        lines.append(
+            f"  {entry['label']}: {entry['status']}" + (f": {entry['reason']}" if entry["reason"] else "")
+        )
+        lines.extend(f"    {note}" for note in entry["notes"])
+        for part in entry["parts"]:
+            if part["status"] == "eligible":
+                lines.append(f"    {part['label']}: {part['covered']} of {part['stations']} stations")
+            else:
+                lines.append(f"    {part['label']}: {part['status']}: {part['reason']}")
+    return lines
+
+
+def _echo_window_check(definition: dict[str, Any], output_path: Path) -> None:
+    """Say what the site's check will make of the output; it changes neither the output nor the exit."""
+    # pylint: disable-next=import-outside-toplevel
+    from firebench.benchmarks.fire_window import check_model_for_window
+
+    try:
+        lines = _window_check_lines(check_model_for_window(definition, output_path))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        click.echo(f"FireBench's check of the output could not be run: {exc}")
+        return
+    for line in lines:
+        click.echo(line)
 
 
 def _run_window_sections(  # pylint: disable=too-many-arguments,too-many-positional-arguments

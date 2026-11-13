@@ -179,6 +179,7 @@ of d02`). To score every family, keep these variables in the output:
 |---|---|
 | every section | `XTIME`, `XLAT`, `XLONG`, `FXLAT`, `FXLONG` |
 | `perimeters` | `TIGN_G` |
+| `arrival_time` | `TIGN_G` (the last output file is enough) |
 | `burn_severity_cbi`, `severity` | `FUEL_FRAC` (the last output file is enough) |
 | `building_damage` | `FIRE_AREA` |
 | `ravg_cc` | `FIRE_AREA`, `CFB` (the last output file is enough) |
@@ -233,3 +234,8 @@ FireBench brings the output to itself:
 
 A run that stops before the end of the period still writes what it has, with a `WARNING`, and
 FireBench's check on the site says what the output cannot enter. Submit `output/FW24-1_WRF-SFIRE.zip`.
+
+The run ends with FireBench's own check of the output, family by family, so a problem shows before the
+file leaves the cluster: `eligible` (the family can be scored), `partial` (only some variables or
+stations can be), or `unavailable` (with the reason). The site runs the same check on reception; the
+check never stops the run or removes the output.

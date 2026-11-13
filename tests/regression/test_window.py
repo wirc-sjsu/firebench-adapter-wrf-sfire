@@ -16,6 +16,7 @@ fire_window = pytest.importorskip("firebench.benchmarks.fire_window", reason="Fi
 from firebench.benchmarks.fire_case_definition import definition_sha256  # noqa: E402
 
 from firebench_adapter_wrf_sfire import get_arrival_time_from_t_ign_g  # noqa: E402
+from firebench_adapter_wrf_sfire import cli  # noqa: E402
 from firebench_adapter_wrf_sfire.cli import main  # noqa: E402
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -121,6 +122,9 @@ def test_window_run_is_eligible_on_both_families(tmp_path):
     result = _run(config_path)
 
     assert result.exit_code == 0, result.output
+    assert "FireBench's check of the output for FW-TEST:" in result.output
+    assert "Fire arrival time: eligible" in result.output
+    assert "Weather at stations: eligible" in result.output
     output = tmp_path / "output" / "FW-TEST_WRF-SFIRE.h5"
     report = fire_window.check_model_for_window(definition, output)
     assert report["accepted"], report["reason"]
@@ -182,10 +186,66 @@ def test_window_run_warns_when_the_run_stops_before_the_period_ends(tmp_path):
     assert result.exit_code == 0, result.output
     assert result.output.count("outside the run's output") == 2
     report = fire_window.check_model_for_window(definition, tmp_path / "output" / "FW-TEST_WRF-SFIRE.h5")
+    assert (tmp_path / "output" / "FW-TEST_WRF-SFIRE.h5").exists()
+    for entry in report["families"]:
+        assert f"{entry['label']}: unavailable: {entry['reason']}" in result.output
     assert {item["family"]: item["status"] for item in report["families"]} == {
         "fire_arrival_time": "unavailable",
         "weather_stations": "unavailable",
     }
+
+
+def test_window_check_lines_say_what_firebench_says():
+    window = {"name": "FW-X"}
+    assert _lines({"window": window, "accepted": False, "reason": "Not an HDF5 file."}) == [
+        "FireBench's check of the output for FW-X:",
+        "  Not an HDF5 file.",
+    ]
+    stations = {
+        "label": "Weather at stations",
+        "status": "partial",
+        "reason": None,
+        "notes": ["A series is accepted when."],
+        "parts": [
+            {"label": "Air temp", "status": "eligible", "stations": 120, "covered": 120, "reason": None},
+            {"label": "Wind speed", "status": "unavailable", "stations": 90, "covered": 87, "reason": "R."},
+        ],
+    }
+    arrival = {
+        "label": "Fire arrival time",
+        "status": "unavailable",
+        "reason": "Why.",
+        "notes": [],
+        "parts": [],
+    }
+    report = {"window": window, "accepted": True, "families": [arrival, stations]}
+    assert _lines(report) == [
+        "FireBench's check of the output for FW-X:",
+        "  Fire arrival time: unavailable: Why.",
+        "  Weather at stations: partial",
+        "    A series is accepted when.",
+        "    Air temp: 120 of 120 stations",
+        "    Wind speed: unavailable: R.",
+    ]
+
+
+def _lines(report):
+    return cli._window_check_lines(report)  # pylint: disable=protected-access
+
+
+def test_window_run_survives_a_check_that_fails(tmp_path, monkeypatch):
+    config_path, _ = _kit(tmp_path)
+
+    def broken(*_args):
+        raise RuntimeError("strange file")
+
+    monkeypatch.setattr(fire_window, "check_model_for_window", broken)
+
+    result = _run(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert "FireBench's check of the output could not be run: strange file" in result.output
+    assert (tmp_path / "output" / "FW-TEST_WRF-SFIRE.zip").exists()
 
 
 def test_window_run_with_one_section(tmp_path):

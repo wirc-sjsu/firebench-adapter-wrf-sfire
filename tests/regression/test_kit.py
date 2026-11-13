@@ -114,6 +114,7 @@ def test_cli_runs_cbi_and_weather_on_a_template(kit):
     result = _run(config_path)
 
     assert result.exit_code == 0, result.output
+    assert "FireBench's check of the output" not in result.output
     with h5py.File(kit / "adapters" / "output" / "model.h5", "r") as out_h5:
         cbi = out_h5[CBI_PATH]
         # FUEL_FRAC 0.1 is high (4), 0.5 moderate (3); the third column is outside the fire grid.
